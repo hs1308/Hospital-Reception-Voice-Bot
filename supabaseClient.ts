@@ -3,8 +3,8 @@ import { createClient } from '@supabase/supabase-js';
 
 const getSupabaseConfig = () => {
   return {
-    url: process.env.NEXT_PUBLIC_SUPABASE_URL || '',
-    anonKey: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '',
+    url: import.meta.env.VITE_SUPABASE_URL || '',
+    anonKey: import.meta.env.VITE_SUPABASE_ANON_KEY || '',
   };
 };
 
