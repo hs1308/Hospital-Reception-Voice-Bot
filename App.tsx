@@ -226,19 +226,21 @@ const App: React.FC = () => {
             scriptProcessor.connect(inCtx.destination);
           },
           onmessage: async (message: LiveServerMessage) => {
-            // Use transcription updates to transition out of 'listening' faster
-            if (message.serverContent?.outputTranscription) {
+            // Defensive access for transcription
+            const outputTranscription = message.serverContent?.outputTranscription;
+            if (outputTranscription?.text) {
               setBotState('processing');
-              const text = message.serverContent.outputTranscription.text?.toLowerCase();
-              if (text && (text.includes('emergency') || text.includes('102') || text.includes('er in sector 3'))) {
+              const text = outputTranscription.text.toLowerCase();
+              if (text.includes('emergency') || text.includes('102') || text.includes('er in sector 3')) {
                 setIsEmergency(true);
               }
             } else if (message.serverContent?.inputTranscription) {
-              // Bot is hearing user, keep it in listening or processing state
               setBotState('listening');
             }
 
-            const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+            const modelParts = message.serverContent?.modelTurn?.parts;
+            const base64Audio = modelParts && modelParts[0]?.inlineData?.data;
+            
             if (base64Audio && outputAudioContextRef.current) {
               setBotState('speaking');
               const ctx = outputAudioContextRef.current;
@@ -251,9 +253,6 @@ const App: React.FC = () => {
               
               source.onended = () => {
                 sourcesRef.current.delete(source);
-                if (sourcesRef.current.size === 0) {
-                  // Wait for turnComplete or more model audio
-                }
               };
 
               source.start(nextStartTimeRef.current);
@@ -261,23 +260,32 @@ const App: React.FC = () => {
               sourcesRef.current.add(source);
             }
 
-            if (message.toolCall && message.toolCall.functionCalls) {
+            // Defensive check for tool calls
+            const toolCall = message.toolCall;
+            if (toolCall && Array.isArray(toolCall.functionCalls)) {
               setBotState('processing');
-              for (const fc of message.toolCall.functionCalls) {
-                if (!fc.name) continue;
-                const handler = (toolHandlers as any)[fc.name];
-                if (handler) {
-                  const result = await handler(fc.args);
-                  sessionPromise.then(s => {
-                    if (s) s.sendToolResponse({ 
-                      functionResponses: [{ id: fc.id || '', name: fc.name || '', response: { result } }] 
+              for (const fc of toolCall.functionCalls) {
+                const functionName = fc.name;
+                const functionId = fc.id;
+                
+                if (functionName && typeof functionName === 'string') {
+                  const handler = (toolHandlers as any)[functionName];
+                  if (handler) {
+                    const result = await handler(fc.args);
+                    sessionPromise.then(s => {
+                      if (s) s.sendToolResponse({ 
+                        functionResponses: [{ 
+                          id: functionId || '', 
+                          name: functionName, 
+                          response: { result } 
+                        }] 
+                      });
                     });
-                  });
+                  }
                 }
               }
             }
 
-            // Signal end of model's turn to go back to listening
             if (message.serverContent?.turnComplete) {
               if (sourcesRef.current.size === 0) {
                 setBotState('listening');
