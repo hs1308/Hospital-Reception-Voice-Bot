@@ -182,7 +182,7 @@ const App: React.FC = () => {
       setBotState('processing');
       addLog('Initializing Voice Link...', 'info');
 
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
       
       const inCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       const outCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
@@ -229,8 +229,8 @@ const App: React.FC = () => {
             // Use transcription updates to transition out of 'listening' faster
             if (message.serverContent?.outputTranscription) {
               setBotState('processing');
-              const text = message.serverContent.outputTranscription.text.toLowerCase();
-              if (text.includes('emergency') || text.includes('102') || text.includes('er in sector 3')) {
+              const text = message.serverContent.outputTranscription.text?.toLowerCase();
+              if (text && (text.includes('emergency') || text.includes('102') || text.includes('er in sector 3'))) {
                 setIsEmergency(true);
               }
             } else if (message.serverContent?.inputTranscription) {
@@ -261,15 +261,16 @@ const App: React.FC = () => {
               sourcesRef.current.add(source);
             }
 
-            if (message.toolCall) {
+            if (message.toolCall && message.toolCall.functionCalls) {
               setBotState('processing');
               for (const fc of message.toolCall.functionCalls) {
+                if (!fc.name) continue;
                 const handler = (toolHandlers as any)[fc.name];
                 if (handler) {
                   const result = await handler(fc.args);
                   sessionPromise.then(s => {
                     if (s) s.sendToolResponse({ 
-                      functionResponses: [{ id: fc.id, name: fc.name, response: { result } }] 
+                      functionResponses: [{ id: fc.id || '', name: fc.name || '', response: { result } }] 
                     });
                   });
                 }
