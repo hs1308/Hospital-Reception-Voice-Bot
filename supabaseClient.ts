@@ -1,14 +1,11 @@
 import { createClient } from '@supabase/supabase-js';
 
 const getSupabaseConfig = () => {
-  // Defensive check for import.meta.env
-  const env = (import.meta as any).env;
-  if (!env) {
-    return { url: '', anonKey: '' };
-  }
+  // Using string-based access to bypass strict TS checks for the demo
+  const meta = import.meta as any;
   return {
-    url: env.VITE_SUPABASE_URL || '',
-    anonKey: env.VITE_SUPABASE_ANON_KEY || '',
+    url: meta.env?.VITE_SUPABASE_URL || '',
+    anonKey: meta.env?.VITE_SUPABASE_ANON_KEY || '',
   };
 };
 
