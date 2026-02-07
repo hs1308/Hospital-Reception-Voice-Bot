@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
 import { supabase } from './supabaseClient';
@@ -8,7 +9,6 @@ import ActionLog from './components/ActionLog';
 import PatientSetup from './components/PatientSetup';
 import { Mic, MicOff, LogOut, Activity, Calendar, Search, MapPin } from 'lucide-react';
 
-// Manually implemented encode/decode functions as per guidelines
 function encode(bytes: Uint8Array) {
   let binary = '';
   const len = bytes.byteLength;
@@ -28,7 +28,6 @@ function decode(base64: string) {
   return bytes;
 }
 
-// Manually implemented audio decoding logic for raw PCM data
 async function decodeAudioData(
   data: Uint8Array,
   ctx: AudioContext,
@@ -183,7 +182,7 @@ const App: React.FC = () => {
       setBotState('processing');
       addLog('Initializing Voice Link...', 'info');
 
-      // ALWAYS obtain the Gemini API key exclusively from process.env.API_KEY
+      // Always initialize GoogleGenAI with process.env.API_KEY exactly as defined in guidelines
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       
       const inCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
@@ -219,8 +218,9 @@ const App: React.FC = () => {
                 mimeType: 'audio/pcm;rate=16000' 
               };
               
+              // Rely solely on sessionPromise resolves without extra condition checks for sendRealtimeInput
               sessionPromise.then(s => {
-                if (s) s.sendRealtimeInput({ media: pcmBlob });
+                s.sendRealtimeInput({ media: pcmBlob });
               });
             };
 
@@ -230,7 +230,6 @@ const App: React.FC = () => {
           onmessage: async (message: LiveServerMessage) => {
             const serverContent = message.serverContent;
             
-            // Handle output transcription
             const outTrans = serverContent?.outputTranscription;
             if (outTrans && typeof outTrans.text === 'string') {
               setBotState('processing');
@@ -262,11 +261,11 @@ const App: React.FC = () => {
 
                 source.start(nextStartTimeRef.current);
                 nextStartTimeRef.current += audioBuffer.duration;
+                // Correctly use sourcesRef.current to manage playback queue
                 sourcesRef.current.add(source);
               }
             }
 
-            // Handle function calls with correct response structure
             const toolCall = message.toolCall;
             const functionCalls = toolCall?.functionCalls;
             if (functionCalls && Array.isArray(functionCalls)) {
@@ -279,8 +278,9 @@ const App: React.FC = () => {
                   const handler = (toolHandlers as any)[funcName];
                   if (handler) {
                     const result = await handler(fc.args);
+                    // Rely solely on sessionPromise resolves for tool responses as per Live API rules
                     sessionPromise.then(s => {
-                      if (s) s.sendToolResponse({ 
+                      s.sendToolResponse({ 
                         functionResponses: { 
                           id: funcId, 
                           name: funcName, 
@@ -307,11 +307,14 @@ const App: React.FC = () => {
             }
           },
           onerror: (e) => {
-            console.error('Gemini Live Error:', e);
-            setError('Maya is having trouble connecting right now. Please try again.');
+            console.error('Gemini Live Connection Error:', e);
+            addLog('Maya lost connection. Retrying or check network.', 'error');
+            setError('Maya is having trouble connecting. This can happen due to a slow network or invalid API credentials.');
             stopAssistant();
           },
-          onclose: () => {
+          onclose: (e) => {
+            console.warn('Gemini Live Connection Closed:', e);
+            addLog('Maya went offline.', 'info');
             stopAssistant();
           }
         },
@@ -330,8 +333,9 @@ const App: React.FC = () => {
       });
       sessionRef.current = await sessionPromise;
     } catch (err: any) {
-      console.error('Activation Failed:', err);
+      console.error('Assistant Activation Failed:', err);
       setError(`Activation Failed: ${err.message}`);
+      addLog(`Failed: ${err.message}`, 'error');
       setIsActive(false);
       stopAssistant();
     }

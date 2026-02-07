@@ -1,11 +1,22 @@
+
 import { createClient } from '@supabase/supabase-js';
 
+const getEnv = (key: string): string => {
+  // Try Vite-style import.meta.env first
+  const metaEnv = (import.meta as any).env;
+  if (metaEnv && metaEnv[key]) return metaEnv[key];
+
+  // Fallback to Node-style process.env (common in Builder/CI)
+  const procEnv = (typeof process !== 'undefined' ? process.env : {}) as any;
+  if (procEnv && procEnv[key]) return procEnv[key];
+
+  return '';
+};
+
 const getSupabaseConfig = () => {
-  // Use (import.meta as any).env for robust access in Vite/Vercel environments
-  const env = (import.meta as any).env;
   return {
-    url: env?.VITE_SUPABASE_URL || '',
-    anonKey: env?.VITE_SUPABASE_ANON_KEY || '',
+    url: getEnv('VITE_SUPABASE_URL'),
+    anonKey: getEnv('VITE_SUPABASE_ANON_KEY'),
   };
 };
 
@@ -13,7 +24,6 @@ const createSupabaseClient = () => {
   const { url, anonKey } = getSupabaseConfig();
   
   if (!url || !anonKey) {
-    // Return a proxy that provides a friendly error message when any method is called
     return new Proxy({} as any, {
       get: (target, prop) => {
         if (prop === 'isProxy') return true;
