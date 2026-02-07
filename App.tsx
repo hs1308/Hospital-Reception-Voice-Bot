@@ -226,57 +226,61 @@ const App: React.FC = () => {
             scriptProcessor.connect(inCtx.destination);
           },
           onmessage: async (message: LiveServerMessage) => {
-            // Defensive access for transcription
-            const outputTranscription = message.serverContent?.outputTranscription;
-            if (outputTranscription?.text) {
+            const serverContent = message.serverContent;
+            
+            // Fix TS18048: Narrow transcription text safely
+            const outputText = serverContent?.outputTranscription?.text;
+            if (outputText) {
               setBotState('processing');
-              const text = outputTranscription.text.toLowerCase();
-              if (text.includes('emergency') || text.includes('102') || text.includes('er in sector 3')) {
+              const lowerText = outputText.toLowerCase();
+              if (lowerText.includes('emergency') || lowerText.includes('102') || lowerText.includes('er in sector 3')) {
                 setIsEmergency(true);
               }
-            } else if (message.serverContent?.inputTranscription) {
+            } else if (serverContent?.inputTranscription) {
               setBotState('listening');
             }
 
-            const modelParts = message.serverContent?.modelTurn?.parts;
-            const base64Audio = modelParts && modelParts[0]?.inlineData?.data;
-            
-            if (base64Audio && outputAudioContextRef.current) {
-              setBotState('speaking');
-              const ctx = outputAudioContextRef.current;
-              
-              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
-              const audioBuffer = await decodeAudioData(decode(base64Audio), ctx, 24000, 1);
-              const source = ctx.createBufferSource();
-              source.buffer = audioBuffer;
-              source.connect(ctx.destination);
-              
-              source.onended = () => {
-                sourcesRef.current.delete(source);
-              };
+            const modelParts = serverContent?.modelTurn?.parts;
+            if (modelParts && modelParts.length > 0) {
+              const base64Audio = modelParts[0]?.inlineData?.data;
+              if (base64Audio && outputAudioContextRef.current) {
+                setBotState('speaking');
+                const ctx = outputAudioContextRef.current;
+                
+                nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
+                const audioBuffer = await decodeAudioData(decode(base64Audio), ctx, 24000, 1);
+                const source = ctx.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(ctx.destination);
+                
+                source.onended = () => {
+                  sourcesRef.current.delete(source);
+                };
 
-              source.start(nextStartTimeRef.current);
-              nextStartTimeRef.current += audioBuffer.duration;
-              sourcesRef.current.add(source);
+                source.start(nextStartTimeRef.current);
+                nextStartTimeRef.current += audioBuffer.duration;
+                sourcesRef.current.add(source);
+              }
             }
 
-            // Defensive check for tool calls
+            // Fix TS18048 & TS2538: Narrow tool calls and function names
             const toolCall = message.toolCall;
-            if (toolCall && Array.isArray(toolCall.functionCalls)) {
+            const functionCalls = toolCall?.functionCalls;
+            if (functionCalls && Array.isArray(functionCalls)) {
               setBotState('processing');
-              for (const fc of toolCall.functionCalls) {
-                const functionName = fc.name;
-                const functionId = fc.id;
+              for (const fc of functionCalls) {
+                const name = fc.name;
+                const id = fc.id;
                 
-                if (functionName && typeof functionName === 'string') {
-                  const handler = (toolHandlers as any)[functionName];
+                if (name && id) {
+                  const handler = (toolHandlers as any)[name];
                   if (handler) {
                     const result = await handler(fc.args);
                     sessionPromise.then(s => {
                       if (s) s.sendToolResponse({ 
                         functionResponses: [{ 
-                          id: functionId || '', 
-                          name: functionName, 
+                          id: id, 
+                          name: name, 
                           response: { result } 
                         }] 
                       });
@@ -286,13 +290,13 @@ const App: React.FC = () => {
               }
             }
 
-            if (message.serverContent?.turnComplete) {
+            if (serverContent?.turnComplete) {
               if (sourcesRef.current.size === 0) {
                 setBotState('listening');
               }
             }
 
-            if (message.serverContent?.interrupted) {
+            if (serverContent?.interrupted) {
               sourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
               sourcesRef.current.clear();
               nextStartTimeRef.current = 0;
