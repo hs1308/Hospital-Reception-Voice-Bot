@@ -183,7 +183,7 @@ const App: React.FC = () => {
       setBotState('processing');
       addLog('Initializing Voice Link...', 'info');
 
-      // Initialize GoogleGenAI with process.env.API_KEY as per guidelines
+      // ALWAYS obtain the Gemini API key exclusively from process.env.API_KEY
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       
       const inCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });

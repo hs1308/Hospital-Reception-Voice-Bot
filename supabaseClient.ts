@@ -1,11 +1,11 @@
 import { createClient } from '@supabase/supabase-js';
 
 const getSupabaseConfig = () => {
-  // Using string-based access to bypass strict TS checks for the demo
-  const meta = import.meta as any;
+  // Use (import.meta as any).env for robust access in Vite/Vercel environments
+  const env = (import.meta as any).env;
   return {
-    url: meta.env?.VITE_SUPABASE_URL || '',
-    anonKey: meta.env?.VITE_SUPABASE_ANON_KEY || '',
+    url: env?.VITE_SUPABASE_URL || '',
+    anonKey: env?.VITE_SUPABASE_ANON_KEY || '',
   };
 };
 
@@ -13,13 +13,25 @@ const createSupabaseClient = () => {
   const { url, anonKey } = getSupabaseConfig();
   
   if (!url || !anonKey) {
+    // Return a proxy that provides a friendly error message when any method is called
     return new Proxy({} as any, {
       get: (target, prop) => {
         if (prop === 'isProxy') return true;
         if (prop === 'from') {
            return () => ({
-             select: () => ({ eq: () => ({ maybeSingle: () => Promise.resolve({ data: null, error: new Error("Supabase URL/Key missing") }) }) }),
-             insert: () => ({ select: () => ({ single: () => Promise.resolve({ data: null, error: new Error("Supabase URL/Key missing") }) }) })
+             select: () => ({ 
+               eq: () => ({ 
+                 maybeSingle: () => Promise.resolve({ data: null, error: new Error("Supabase VITE_ variables missing") }),
+                 order: () => ({ 
+                   maybeSingle: () => Promise.resolve({ data: null, error: new Error("Supabase VITE_ variables missing") }) 
+                 })
+               }) 
+             }),
+             insert: () => ({ 
+               select: () => ({ 
+                 single: () => Promise.resolve({ data: null, error: new Error("Supabase VITE_ variables missing") }) 
+               }) 
+             })
            });
         }
         return () => {};

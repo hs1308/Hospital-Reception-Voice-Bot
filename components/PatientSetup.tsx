@@ -1,4 +1,3 @@
-
 import React, { useState } from 'react';
 import { supabase, isSupabaseConfigured } from '../supabaseClient';
 import { Patient } from '../types';
@@ -18,7 +17,7 @@ const PatientSetup: React.FC<PatientSetupProps> = ({ onComplete }) => {
     if (!phone) return;
     
     if (!isSupabaseConfigured()) {
-      setError("Database keys are missing. Please add NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY to your environment variables or Vercel settings.");
+      setError("Database keys are missing. Please add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to your environment variables or Vercel settings.");
       return;
     }
 
@@ -40,7 +39,7 @@ const PatientSetup: React.FC<PatientSetupProps> = ({ onComplete }) => {
         onComplete(newData as Patient);
       }
     } catch (err: any) {
-      setError(`Database Error: ${err.message || 'Could not connect to Supabase. Check your URL and keys.'}`);
+      setError(`Database Error: ${err.message || 'Could not connect to Supabase. Check your VITE_ variables.'}`);
     } finally {
       setLoading(false);
     }
