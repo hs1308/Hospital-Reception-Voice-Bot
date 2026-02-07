@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
 import { supabase } from './supabaseClient';
@@ -9,6 +8,7 @@ import ActionLog from './components/ActionLog';
 import PatientSetup from './components/PatientSetup';
 import { Mic, MicOff, LogOut, Activity, Calendar, Search, MapPin } from 'lucide-react';
 
+// Manually implemented encode/decode functions as per guidelines
 function encode(bytes: Uint8Array) {
   let binary = '';
   const len = bytes.byteLength;
@@ -28,6 +28,7 @@ function decode(base64: string) {
   return bytes;
 }
 
+// Manually implemented audio decoding logic for raw PCM data
 async function decodeAudioData(
   data: Uint8Array,
   ctx: AudioContext,
@@ -182,7 +183,8 @@ const App: React.FC = () => {
       setBotState('processing');
       addLog('Initializing Voice Link...', 'info');
 
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+      // Initialize GoogleGenAI with process.env.API_KEY as per guidelines
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       
       const inCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       const outCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
@@ -228,20 +230,21 @@ const App: React.FC = () => {
           onmessage: async (message: LiveServerMessage) => {
             const serverContent = message.serverContent;
             
-            // Fix TS18048: Narrow transcription text safely
-            const outputText = serverContent?.outputTranscription?.text;
-            if (outputText) {
+            // Handle output transcription
+            const outTrans = serverContent?.outputTranscription;
+            if (outTrans && typeof outTrans.text === 'string') {
               setBotState('processing');
-              const lowerText = outputText.toLowerCase();
-              if (lowerText.includes('emergency') || lowerText.includes('102') || lowerText.includes('er in sector 3')) {
+              const transcriptText = outTrans.text.toLowerCase();
+              if (transcriptText.includes('emergency') || transcriptText.includes('102') || transcriptText.includes('er in sector 3')) {
                 setIsEmergency(true);
               }
             } else if (serverContent?.inputTranscription) {
               setBotState('listening');
             }
 
-            const modelParts = serverContent?.modelTurn?.parts;
-            if (modelParts && modelParts.length > 0) {
+            const modelTurn = serverContent?.modelTurn;
+            const modelParts = modelTurn?.parts;
+            if (modelParts && Array.isArray(modelParts) && modelParts.length > 0) {
               const base64Audio = modelParts[0]?.inlineData?.data;
               if (base64Audio && outputAudioContextRef.current) {
                 setBotState('speaking');
@@ -263,26 +266,26 @@ const App: React.FC = () => {
               }
             }
 
-            // Fix TS18048 & TS2538: Narrow tool calls and function names
+            // Handle function calls with correct response structure
             const toolCall = message.toolCall;
             const functionCalls = toolCall?.functionCalls;
             if (functionCalls && Array.isArray(functionCalls)) {
               setBotState('processing');
               for (const fc of functionCalls) {
-                const name = fc.name;
-                const id = fc.id;
+                const funcName = fc.name;
+                const funcId = fc.id;
                 
-                if (name && id) {
-                  const handler = (toolHandlers as any)[name];
+                if (typeof funcName === 'string' && typeof funcId === 'string') {
+                  const handler = (toolHandlers as any)[funcName];
                   if (handler) {
                     const result = await handler(fc.args);
                     sessionPromise.then(s => {
                       if (s) s.sendToolResponse({ 
-                        functionResponses: [{ 
-                          id: id, 
-                          name: name, 
+                        functionResponses: { 
+                          id: funcId, 
+                          name: funcName, 
                           response: { result } 
-                        }] 
+                        } 
                       });
                     });
                   }

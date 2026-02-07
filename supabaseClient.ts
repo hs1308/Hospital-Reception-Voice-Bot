@@ -1,10 +1,14 @@
-
 import { createClient } from '@supabase/supabase-js';
 
 const getSupabaseConfig = () => {
+  // Defensive check for import.meta.env
+  const env = (import.meta as any).env;
+  if (!env) {
+    return { url: '', anonKey: '' };
+  }
   return {
-    url: import.meta.env.VITE_SUPABASE_URL || '',
-    anonKey: import.meta.env.VITE_SUPABASE_ANON_KEY || '',
+    url: env.VITE_SUPABASE_URL || '',
+    anonKey: env.VITE_SUPABASE_ANON_KEY || '',
   };
 };
 
@@ -12,14 +16,16 @@ const createSupabaseClient = () => {
   const { url, anonKey } = getSupabaseConfig();
   
   if (!url || !anonKey) {
-    // Return a proxy that throws a helpful error when any property is accessed.
-    // This prevents the application from crashing on initial load.
     return new Proxy({} as any, {
       get: (target, prop) => {
         if (prop === 'isProxy') return true;
-        throw new Error(
-          "Supabase configuration missing. Ensure NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY are set in your environment variables."
-        );
+        if (prop === 'from') {
+           return () => ({
+             select: () => ({ eq: () => ({ maybeSingle: () => Promise.resolve({ data: null, error: new Error("Supabase URL/Key missing") }) }) }),
+             insert: () => ({ select: () => ({ single: () => Promise.resolve({ data: null, error: new Error("Supabase URL/Key missing") }) }) })
+           });
+        }
+        return () => {};
       },
     });
   }
