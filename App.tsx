@@ -55,12 +55,23 @@ const App: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [isEmergency, setIsEmergency] = useState(false);
 
+  // Refs for audio hardware
   const inputAudioContextRef = useRef<AudioContext | null>(null);
   const outputAudioContextRef = useRef<AudioContext | null>(null);
+  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  
+  // Refs for conversation state
   const nextStartTimeRef = useRef(0);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const sessionRef = useRef<any>(null);
-  const heartbeatIntervalRef = useRef<number | null>(null);
+  const isStartingRef = useRef(false);
+  const hangupPendingRef = useRef(false);
+
+  // Call Summary Tracking Refs
+  const callStartTimeRef = useRef<Date | null>(null);
+  const transcriptHistoryRef = useRef<{ role: 'user' | 'maya'; text: string }[]>([]);
+  const currentTurnRef = useRef<{ user?: string; maya?: string }>({});
 
   const addLog = useCallback((message: string, type: 'tool' | 'info' | 'error' = 'info') => {
     setLogs((prev) => [
@@ -69,39 +80,102 @@ const App: React.FC = () => {
     ]);
   }, []);
 
-  const logTechnicalEvent = async (event: string, metadata: any = {}) => {
-    console.log(`[MAYA TECH] ${event}`, metadata);
+  const saveCallSummary = async (techIssue: boolean = false) => {
+    if (!callStartTimeRef.current || !patient) return;
+
+    const endTime = new Date();
+    const durationMs = endTime.getTime() - callStartTimeRef.current.getTime();
+    const durationSeconds = Math.floor(durationMs / 1000);
+    const durationString = `${Math.floor(durationSeconds / 60)}m ${durationSeconds % 60}s`;
+    
+    // Prepare conversation for AI summarization
+    const fullTranscript = transcriptHistoryRef.current
+      .map(entry => `${entry.role.toUpperCase()}: ${entry.text}`)
+      .join('\n');
+
+    let summaryText = "Call ended before significant conversation.";
+
+    if (transcriptHistoryRef.current.length > 0) {
+      try {
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+        const response = await ai.models.generateContent({
+          model: 'gemini-3-flash-preview',
+          contents: `Analyze this hospital call transcript and provide a brief summary including: 
+          1. Why the user called.
+          2. What the resolution was.
+          3. Mention any technical issues if detected or if the call ended abruptly.
+          
+          Transcript:
+          ${fullTranscript}
+          
+          ${techIssue ? 'NOTE: A technical socket error was reported during this call.' : ''}`,
+          config: {
+            systemInstruction: "You are a quality assurance auditor for a hospital. Keep summaries concise (max 3 sentences).",
+          }
+        });
+        summaryText = response.text || "Summary generation failed.";
+      } catch (e) {
+        summaryText = "Technical failure during summary generation. Transcript available in debug logs.";
+      }
+    } else if (techIssue) {
+      summaryText = "Technical issue prevented conversation from starting.";
+    }
+
     try {
-      await supabase.from('maya_debug_logs').insert([{
-        event,
-        metadata,
-        patient_phone: patient?.phone || 'unknown',
-        timestamp: new Date().toISOString()
+      await supabase.from('user_call_summary').insert([{
+        user_number: patient.phone,
+        user_name: patient.name,
+        start_time: callStartTimeRef.current.toISOString(),
+        end_time: endTime.toISOString(),
+        duration: durationString,
+        call_summary: summaryText,
+        tech_issue_detected: techIssue
       }]);
-    } catch (e) {}
+      console.log('Call summary saved successfully.');
+    } catch (dbErr) {
+      console.error('Failed to save call summary to database:', dbErr);
+    }
   };
 
-  const stopAssistant = useCallback(() => {
-    logTechnicalEvent('Session Shutdown');
-    if (heartbeatIntervalRef.current) {
-      window.clearInterval(heartbeatIntervalRef.current);
-      heartbeatIntervalRef.current = null;
+  const stopAssistant = useCallback((techIssue: boolean = false) => {
+    // Save summary before cleaning up refs
+    saveCallSummary(techIssue);
+    
+    for (const source of sourcesRef.current) {
+      try { source.stop(); } catch (e) {}
     }
+    sourcesRef.current.clear();
+
+    if (scriptProcessorRef.current) {
+      scriptProcessorRef.current.disconnect();
+      scriptProcessorRef.current.onaudioprocess = null;
+      scriptProcessorRef.current = null;
+    }
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach(track => track.stop());
+      mediaStreamRef.current = null;
+    }
+
     if (sessionRef.current) {
       try { sessionRef.current.close(); } catch(e) {}
       sessionRef.current = null;
     }
     if (inputAudioContextRef.current) {
       inputAudioContextRef.current.close().catch(() => {});
+      inputAudioContextRef.current = null;
     }
     if (outputAudioContextRef.current) {
       outputAudioContextRef.current.close().catch(() => {});
+      outputAudioContextRef.current = null;
     }
-    inputAudioContextRef.current = null;
-    outputAudioContextRef.current = null;
+
     setIsActive(false);
     setBotState('idle');
-    addLog('Call disconnected.', 'info');
+    isStartingRef.current = false;
+    hangupPendingRef.current = false;
+    callStartTimeRef.current = null;
+    transcriptHistoryRef.current = [];
+    addLog('Call completed.', 'info');
   }, [addLog, patient]);
 
   useEffect(() => {
@@ -109,14 +183,30 @@ const App: React.FC = () => {
   }, [stopAssistant]);
 
   const toolHandlers = {
+    update_patient_name: async (args: { name: string }) => {
+      if (!patient) return "ERROR: No patient session.";
+      addLog(`Updating record for: ${args.name}`, 'tool');
+      try {
+        const { error } = await supabase
+          .from('patients')
+          .update({ name: args.name })
+          .eq('phone', patient.phone);
+        
+        if (error) throw error;
+        setPatient(prev => prev ? ({ ...prev, name: args.name }) : null);
+        return "SUCCESS: Record updated. I will now refer to you as " + args.name;
+      } catch (err: any) {
+        return `ERROR: ${err.message}`;
+      }
+    },
     get_doctors: async () => {
-      addLog('Accessing Provider Database...', 'tool');
+      addLog('Fetching provider list...', 'tool');
       const { data, error } = await supabase.from('doctors').select('*');
       return error ? `ERROR: ${error.message}` : data;
     },
     get_my_appointments: async () => {
-      if (!patient) return "ERROR: No patient identified.";
-      addLog('Retrieving your schedule...', 'tool');
+      if (!patient) return "ERROR: No session.";
+      addLog('Accessing your records...', 'tool');
       const { data, error } = await supabase
         .from('doctor_appointments')
         .select('id, appointment_time, status, doctors(name, specialty)')
@@ -124,85 +214,71 @@ const App: React.FC = () => {
         .eq('status', 'scheduled');
       return error ? `ERROR: ${error.message}` : data;
     },
-    get_available_slots: async (args: { doctor_id: string; date: string }) => {
-      addLog(`Querying slots for ${args.date}...`, 'tool');
+    get_available_slots: async (args: { doctor_id: string; start_date: string; days_to_check?: number }) => {
+      const days = Math.min(args.days_to_check || 1, 7);
+      addLog(`Checking next ${days} days...`, 'tool');
+      const endDate = new Date(args.start_date);
+      endDate.setDate(endDate.getDate() + days);
       const { data, error } = await supabase
         .from('doctor_slots')
         .select('id, start_time')
         .eq('doctor_id', args.doctor_id)
         .eq('is_available', true)
-        .gte('start_time', `${args.date}T00:00:00Z`)
-        .lte('start_time', `${args.date}T23:59:59Z`)
-        .order('start_time', { ascending: true });
-      
-      if (data?.length === 0) {
-        logTechnicalEvent('No Slots Found', { doctor: args.doctor_id, date: args.date });
-      }
+        .gte('start_time', `${args.start_date}T00:00:00Z`)
+        .lte('start_time', `${endDate.toISOString().split('T')[0]}T23:59:59Z`)
+        .order('start_time', { ascending: true })
+        .limit(20);
       return error ? `ERROR: ${error.message}` : data;
     },
     book_appointment: async (args: { doctor_id: string; slot_id: string; time_string: string }) => {
-      addLog(`Confirming booking for ${args.time_string}...`, 'tool');
+      addLog(`Reserving slot for ${args.time_string}...`, 'tool');
       try {
-        const { data: appt, error: apptErr } = await supabase
-          .from('doctor_appointments')
-          .insert([{ 
-            patient_phone: patient?.phone, 
-            doctor_id: args.doctor_id, 
-            appointment_time: args.time_string, 
-            status: 'scheduled' 
-          }])
-          .select().single();
+        const { data: appt, error: apptErr } = await supabase.from('doctor_appointments').insert([{ 
+          patient_phone: patient?.phone, doctor_id: args.doctor_id, appointment_time: args.time_string, status: 'scheduled' 
+        }]).select().single();
         if (apptErr) throw apptErr;
-        await supabase.from('doctor_slots').update({ 
-          is_available: false, 
-          booked_by_phone: patient?.phone, 
-          appointment_id: appt.id 
-        }).eq('id', args.slot_id);
-        return `SUCCESS: Appointment confirmed.`;
+        await supabase.from('doctor_slots').update({ is_available: false, booked_by_phone: patient?.phone, appointment_id: appt.id }).eq('id', args.slot_id);
+        return `SUCCESS: Booked.`;
       } catch (err: any) { return `ERROR: ${err.message}`; }
     },
-    cancel_appointment: async (args: { appointment_id: string, type: string }) => {
-      addLog(`Cancelling appointment ${args.appointment_id}...`, 'tool');
+    cancel_appointment: async (args: { appointment_id: string }) => {
+      addLog(`Cancelling booking...`, 'tool');
       try {
         await supabase.from('doctor_appointments').update({ status: 'cancelled' }).eq('id', args.appointment_id);
         await supabase.from('doctor_slots').update({ is_available: true, booked_by_phone: null, appointment_id: null }).eq('appointment_id', args.appointment_id);
-        return "SUCCESS: Appointment cancelled.";
-      } catch (err: any) { return `ERROR: ${err.message}`; }
-    },
-    reschedule_appointment: async (args: { appointment_id: string, new_slot_id: string }) => {
-      addLog(`Rescheduling to new slot...`, 'tool');
-      try {
-        const { data: slot } = await supabase.from('doctor_slots').select('start_time').eq('id', args.new_slot_id).single();
-        await supabase.from('doctor_slots').update({ is_available: true, booked_by_phone: null, appointment_id: null }).eq('appointment_id', args.appointment_id);
-        await supabase.from('doctor_appointments').update({ appointment_time: slot.start_time }).eq('id', args.appointment_id);
-        await supabase.from('doctor_slots').update({ is_available: false, booked_by_phone: patient?.phone, appointment_id: args.appointment_id }).eq('id', args.new_slot_id);
-        return "SUCCESS: Rescheduled.";
+        return "SUCCESS: Booking cancelled.";
       } catch (err: any) { return `ERROR: ${err.message}`; }
     },
     get_opd_timings: async (args: { department?: string }) => {
-      addLog('Consulting department schedule...', 'tool');
+      addLog('Consulting department list...', 'tool');
       let query = supabase.from('opd_timings').select('*');
       if (args.department) query = query.ilike('department', `%${args.department}%`);
       const { data, error } = await query;
       return error ? `ERROR: ${error.message}` : data;
     },
     hang_up: async () => {
-      addLog('Maya is hanging up. Goodbye!', 'info');
-      logTechnicalEvent('Hang Up Requested');
-      setTimeout(() => stopAssistant(), 1000);
-      return "SUCCESS: Hanging up.";
+      addLog('Farewell pending...', 'info');
+      hangupPendingRef.current = true;
+      setTimeout(() => {
+        if (hangupPendingRef.current) stopAssistant();
+      }, 5000);
+      return "SUCCESS: Hanging up after message.";
     }
   };
 
   const startAssistant = async () => {
-    if (!patient) return;
+    if (!patient || isStartingRef.current) return;
+    
+    isStartingRef.current = true;
     setError(null);
     setIsEmergency(false);
+    transcriptHistoryRef.current = [];
+    currentTurnRef.current = {};
     
     try {
       setIsActive(true);
       setBotState('processing');
-      addLog('Starting Voice Session...', 'info');
+      addLog('Waking Maya...', 'info');
 
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       const inCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
@@ -211,24 +287,20 @@ const App: React.FC = () => {
       inputAudioContextRef.current = inCtx;
       outputAudioContextRef.current = outCtx;
 
-      const resumeAudio = async () => {
-        if (inCtx.state === 'suspended') await inCtx.resume();
-        if (outCtx.state === 'suspended') await outCtx.resume();
-      };
-      await resumeAudio();
-
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
       
       const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         callbacks: {
           onopen: () => {
+            callStartTimeRef.current = new Date();
             setBotState('listening');
-            addLog('Maya is online.', 'info');
-            logTechnicalEvent('Connection Open');
+            addLog('Maya is ready.', 'info');
             
             const source = inCtx.createMediaStreamSource(stream);
             const scriptProcessor = inCtx.createScriptProcessor(4096, 1, 1);
+            scriptProcessorRef.current = scriptProcessor;
             
             scriptProcessor.onaudioprocess = (e) => {
               const inputData = e.inputBuffer.getChannelData(0);
@@ -242,25 +314,26 @@ const App: React.FC = () => {
 
             source.connect(scriptProcessor);
             scriptProcessor.connect(inCtx.destination);
-
-            // SILENT HEARTBEAT: Prevent server drop during long silences
-            heartbeatIntervalRef.current = window.setInterval(() => {
-              resumeAudio();
-              sessionPromise.then(s => {
-                s.sendRealtimeInput({
-                  media: {
-                    data: encode(new Uint8Array(100)), // Tiny silent packet
-                    mimeType: 'audio/pcm;rate=16000'
-                  }
-                });
-              });
-              logTechnicalEvent('Heartbeat');
-            }, 20000);
           },
           onmessage: async (message: LiveServerMessage) => {
+            // Track Transcriptions for Summary
             if (message.serverContent?.outputTranscription) {
-              const text = message.serverContent.outputTranscription.text.toLowerCase();
-              if (text.includes('emergency') || text.includes('102')) setIsEmergency(true);
+              const text = message.serverContent.outputTranscription.text;
+              currentTurnRef.current.maya = (currentTurnRef.current.maya || '') + text;
+              if (text.toLowerCase().includes('emergency')) setIsEmergency(true);
+            } else if (message.serverContent?.inputTranscription) {
+              const text = message.serverContent.inputTranscription.text;
+              currentTurnRef.current.user = (currentTurnRef.current.user || '') + text;
+            }
+
+            if (message.serverContent?.turnComplete) {
+              if (currentTurnRef.current.user) {
+                transcriptHistoryRef.current.push({ role: 'user', text: currentTurnRef.current.user });
+              }
+              if (currentTurnRef.current.maya) {
+                transcriptHistoryRef.current.push({ role: 'maya', text: currentTurnRef.current.maya });
+              }
+              currentTurnRef.current = {};
             }
 
             const modelParts = message.serverContent?.modelTurn?.parts;
@@ -272,7 +345,18 @@ const App: React.FC = () => {
               const source = ctx.createBufferSource();
               source.buffer = buffer;
               source.connect(ctx.destination);
-              source.onended = () => sourcesRef.current.delete(source);
+              
+              source.onended = () => {
+                sourcesRef.current.delete(source);
+                if (sourcesRef.current.size === 0) {
+                  setBotState('listening');
+                  if (hangupPendingRef.current) {
+                    addLog('Farewell complete. Disconnecting.', 'info');
+                    stopAssistant();
+                  }
+                }
+              };
+
               source.start(nextStartTimeRef.current);
               nextStartTimeRef.current += buffer.duration;
               sourcesRef.current.add(source);
@@ -286,53 +370,50 @@ const App: React.FC = () => {
                 }));
               }
             }
-
-            if (message.serverContent?.turnComplete && sourcesRef.current.size === 0) {
-              setBotState('listening');
-            }
           },
           onerror: (e) => {
-            logTechnicalEvent('Error', { msg: e.message });
-            setError('Connection glitch. Try speaking again.');
-            stopAssistant();
+            setError('Maya is experiencing high traffic. Please try again.');
+            stopAssistant(true);
           },
           onclose: (e) => {
-            logTechnicalEvent('Close', { code: e.code, reason: e.reason });
             stopAssistant();
           }
         },
         config: {
           responseModalities: [Modality.AUDIO],
-          systemInstruction: SYSTEM_INSTRUCTION + `\n\nPatient: ${patient.name} (${patient.phone})`,
+          systemInstruction: SYSTEM_INSTRUCTION + `\n\nPatient Name: ${patient.name}\nPatient Phone: ${patient.phone}`,
           tools: [{ functionDeclarations: TOOLS }],
           outputAudioTranscription: {},
+          inputAudioTranscription: {},
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } } }
         }
       });
       sessionRef.current = await sessionPromise;
     } catch (err: any) {
-      setError(`Maya couldn't start: ${err.message}`);
-      setIsActive(false);
-      stopAssistant();
+      setError(`Hardware link failed: ${err.message}`);
+      stopAssistant(true);
     }
   };
 
   return (
     <div className={`min-h-screen flex flex-col transition-colors duration-1000 ${isEmergency ? 'bg-red-50' : 'bg-slate-50'}`}>
-      <nav className="bg-white border-b border-slate-200 px-8 py-5 flex items-center justify-between sticky top-0 z-50">
-        <div className="flex items-center space-x-4">
+      <nav className="bg-white border-b border-slate-200 px-8 py-4 flex items-center justify-between sticky top-0 z-50">
+        <div className="flex items-center space-x-3">
           <div className={`${isEmergency ? 'bg-red-600' : 'bg-indigo-600'} p-2 rounded-xl`}>
-            <Activity className="w-6 h-6 text-white" />
+            <Activity className="w-5 h-5 text-white" />
           </div>
           <div>
-            <h1 className="font-black text-xl text-slate-900">Maya Front Desk</h1>
-            <p className="text-[10px] text-indigo-600 font-bold uppercase tracking-widest">HSR Layout • Sector 7</p>
+            <h1 className="font-black text-lg text-slate-900 leading-none">Maya AI</h1>
+            <p className="text-[10px] text-indigo-600 font-black uppercase tracking-widest mt-1">HSR Sector 7</p>
           </div>
         </div>
         {patient && (
-          <button onClick={() => { setPatient(null); stopAssistant(); }} className="p-2 hover:bg-slate-100 rounded-lg transition-colors">
-            <LogOut className="w-5 h-5 text-slate-400" />
-          </button>
+          <div className="flex items-center space-x-4">
+            <span className="text-xs font-bold text-slate-500 hidden sm:inline-block">Logged in: <span className="text-slate-900">{patient.name}</span></span>
+            <button onClick={() => { setPatient(null); stopAssistant(); }} className="p-2 hover:bg-slate-100 rounded-lg">
+              <LogOut className="w-5 h-5 text-slate-400" />
+            </button>
+          </div>
         )}
       </nav>
 
@@ -343,47 +424,45 @@ const App: React.FC = () => {
               <PatientSetup onComplete={setPatient} />
             </div>
           ) : (
-            <div className="flex-1 flex flex-col items-center justify-center p-8 text-center max-w-5xl mx-auto w-full">
+            <div className="flex-1 flex flex-col items-center justify-center p-8 text-center max-w-4xl mx-auto w-full">
               {!isActive ? (
-                <div className="w-full space-y-12 animate-in fade-in duration-700">
-                  <h2 className="text-5xl font-black text-slate-900 leading-tight">
-                    Welcome, <span className="text-indigo-600">{patient.name}</span>.
-                  </h2>
+                <div className="w-full space-y-12 animate-in fade-in slide-in-from-bottom-4 duration-500">
+                  <h2 className="text-4xl font-black text-slate-900">Hello, <span className="text-indigo-600">{patient.name}</span>.</h2>
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                    <div className="bg-white p-6 rounded-3xl border border-slate-100 shadow-sm text-left">
-                      <Calendar className="w-8 h-8 text-blue-500 mb-3" />
-                      <h3 className="font-bold text-slate-800">Appointments</h3>
-                      <p className="text-xs text-slate-500 leading-relaxed">Book, reschedule or cancel in seconds.</p>
+                    <div className="bg-white p-8 rounded-[2.5rem] border border-slate-100 shadow-sm text-left group hover:border-indigo-200 transition-all cursor-pointer">
+                      <Calendar className="w-8 h-8 text-blue-500 mb-4" />
+                      <h3 className="font-bold text-slate-800">Booking</h3>
+                      <p className="text-xs text-slate-500 mt-2">Specialist appointments.</p>
                     </div>
-                    <div className="bg-white p-6 rounded-3xl border border-slate-100 shadow-sm text-left">
-                      <Search className="w-8 h-8 text-emerald-500 mb-3" />
-                      <h3 className="font-bold text-slate-800">OPD Hours</h3>
-                      <p className="text-xs text-slate-500 leading-relaxed">Check department timings in real-time.</p>
+                    <div className="bg-white p-8 rounded-[2.5rem] border border-slate-100 shadow-sm text-left group hover:border-emerald-200 transition-all cursor-pointer">
+                      <Search className="w-8 h-8 text-emerald-500 mb-4" />
+                      <h3 className="font-bold text-slate-800">Timings</h3>
+                      <p className="text-xs text-slate-500 mt-2">OPD schedule info.</p>
                     </div>
-                    <div className="bg-white p-6 rounded-3xl border border-slate-100 shadow-sm text-left">
-                      <MapPin className="w-8 h-8 text-orange-500 mb-3" />
-                      <h3 className="font-bold text-slate-800">Hospital Map</h3>
-                      <p className="text-xs text-slate-500 leading-relaxed">Find any ward or lab in Sector 7.</p>
+                    <div className="bg-white p-8 rounded-[2.5rem] border border-slate-100 shadow-sm text-left group hover:border-orange-200 transition-all cursor-pointer">
+                      <MapPin className="w-8 h-8 text-orange-500 mb-4" />
+                      <h3 className="font-bold text-slate-800">Locate</h3>
+                      <p className="text-xs text-slate-500 mt-2">Ward & Lab directions.</p>
                     </div>
                   </div>
-                  <button onClick={startAssistant} className="inline-flex items-center justify-center px-10 py-5 font-black text-lg text-white bg-slate-900 rounded-[2rem] hover:bg-indigo-600 transition-all shadow-xl shadow-indigo-100">
+                  <button onClick={startAssistant} className="inline-flex items-center justify-center px-10 py-5 font-black text-lg text-white bg-slate-900 rounded-[2rem] hover:bg-indigo-600 transition-all shadow-xl shadow-indigo-100/50">
                     <Mic className="w-6 h-6 mr-3" />
-                    Speak to Maya
+                    Connect to Maya
                   </button>
                 </div>
               ) : (
-                <div className="flex flex-col items-center justify-center h-full space-y-12 w-full py-12">
+                <div className="flex flex-col items-center justify-center h-full space-y-12 w-full">
                   <PulseOrb state={botState} isEmergency={isEmergency} />
-                  <div className="w-full max-w-xl">
+                  <div className="w-full max-w-lg space-y-8">
                     <div className="bg-white px-8 py-6 rounded-[2.5rem] border border-slate-200 shadow-2xl flex items-center space-x-6">
                       <div className={`w-3 h-3 rounded-full animate-pulse ${isEmergency ? 'bg-red-600' : 'bg-indigo-500'}`} />
                       <p className="text-lg text-slate-800 font-bold">
-                        {botState === 'listening' ? "Maya is listening..." : botState === 'speaking' ? "Maya is talking..." : "Maya is processing..."}
+                        {botState === 'listening' ? "Maya is listening..." : botState === 'speaking' ? "Maya is responding..." : "Processing..."}
                       </p>
                     </div>
-                    {error && <p className="mt-4 text-rose-600 font-bold text-sm bg-rose-50 p-3 rounded-xl">{error}</p>}
-                    <button onClick={stopAssistant} className="mt-8 bg-rose-50 text-rose-600 px-8 py-4 rounded-full font-bold border border-rose-100 hover:bg-rose-100 transition-all">
-                      End Session
+                    {error && <p className="text-rose-600 font-bold text-sm bg-rose-50 p-4 rounded-2xl border border-rose-100">{error}</p>}
+                    <button onClick={() => stopAssistant()} className="bg-slate-100 text-slate-600 px-8 py-4 rounded-full font-black text-sm hover:bg-rose-50 hover:text-rose-600 transition-all">
+                      Disconnect
                     </button>
                   </div>
                 </div>
@@ -391,7 +470,7 @@ const App: React.FC = () => {
             </div>
           )}
         </div>
-        <aside className="hidden lg:block w-[350px] bg-white border-l border-slate-200">
+        <aside className="hidden lg:block w-[340px] bg-white border-l border-slate-200">
           <ActionLog logs={logs} />
         </aside>
       </main>

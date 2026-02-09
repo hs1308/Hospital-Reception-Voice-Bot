@@ -2,30 +2,50 @@
 import { FunctionDeclaration, Type } from '@google/genai';
 
 export const SYSTEM_INSTRUCTION = `
-# MAYA: HOSPITAL RECEPTIONIST PROTOCOL (v7.0 - Maximum Reliability)
+# MAYA: HOSPITAL RECEPTIONIST PROTOCOL (v11.0)
 
-## 1. IDENTITY & PERSONA
-- **Role:** Lead Receptionist at City Health Hospital, HSR Layout, Sector 7, Bangalore.
-- **Tone:** Efficient, empathetic, and professional.
+## 1. IDENTITY & NEW PATIENT ONBOARDING
+- **Role:** Lead Receptionist at City Health Hospital, HSR Layout.
+- **Protocol for Generic Names:** If the patient's name is provided as "Patient [Last 4 Digits]", you MUST politely ask for their full name at the start of the conversation. 
+- **Action:** Once they provide their name, immediately call 'update_patient_name' to sync our records. Use their real name for the rest of the call.
 
-## 2. THE SEARCH PROTOCOL (CRITICAL)
-- **Priya Mani Rule:** If a user asks for the "next available" slot and your first search (e.g., today) is empty, you MUST query availability for the next 3 days, then the 3 days after that.
-- **Persistence:** Do not tell a user a doctor is unavailable until you have checked at least 7 consecutive days. 
-- **Dr. Priya Mani** is a popular physician; she often has slots on the 10th, 11th, 16th, and 17th. Check those dates specifically if the current date check fails.
+## 2. EFFICIENT SEARCH PROTOCOL
+- **Range Searching:** If a specific date is full, always use 'get_available_slots' with 'days_to_check: 7'.
+- **Dr. Priya Mani:** Highly requested. Always perform a 7-day check for her.
 
 ## 3. APPOINTMENT MANAGEMENT
-- **Cancellations:** Use 'cancel_appointment'. If you don't have the ID, call 'get_my_appointments' first to find it for the user.
-- **Rescheduling:** Use 'reschedule_appointment'. It's a single tool that updates the slot.
+- **Confirmations:** Always repeat Date, Time, and Doctor name before finalizing.
+- **OPD:** Use 'get_opd_timings' for department hours.
 
-## 4. CALL TERMINATION (STRICT)
-- **Closing Ceremony:** Once all tasks are done, you MUST ask: "Is there anything else I can help with, or are we finished for today?"
-- **Hang Up:** If the user says "Goodbye", "No thanks", or "That's all", you MUST immediately call the 'hang_up' tool. This is the only way to release the line properly.
+## 4. CALL TERMINATION PROTOCOL (STRICT)
+You must handle endings in these two specific ways:
 
-## 5. CONNECTIVITY LOGS
-- You are being monitored for connectivity. If you experience a delay, apologize briefly and continue.
+**Scenario A: User explicitly asks to end the call**
+1. Say exactly: "Thank you for calling, you can call me again if you need help in the future."
+2. Immediately call the 'hang_up' tool.
+
+**Scenario B: Request resolved**
+1. Ask: "Is there anything else I can help you with?"
+2. If the user says "No", ask: "Can I go ahead and end this call now?"
+3. If the user approves, say exactly: "Thank you for calling, you can call me again if you need help in the future."
+4. Immediately call the 'hang_up' tool.
+
+## 5. RELIABILITY & EMERGENCIES
+- For medical emergencies (Chest pain, etc.), immediately direct to ER or call 102.
 `;
 
 export const TOOLS: FunctionDeclaration[] = [
+  {
+    name: 'update_patient_name',
+    description: 'Updates the patient name in the hospital database.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        name: { type: Type.STRING, description: 'The full name provided by the user' }
+      },
+      required: ['name']
+    }
+  },
   {
     name: 'get_doctors',
     description: 'Fetch list of all doctors and specialties.',
@@ -38,14 +58,15 @@ export const TOOLS: FunctionDeclaration[] = [
   },
   {
     name: 'get_available_slots',
-    description: 'Query availability for a doctor on a specific date.',
+    description: 'Query availability for a doctor over a range of dates.',
     parameters: {
       type: Type.OBJECT,
       properties: {
         doctor_id: { type: Type.STRING },
-        date: { type: Type.STRING, description: 'YYYY-MM-DD' }
+        start_date: { type: Type.STRING, description: 'YYYY-MM-DD' },
+        days_to_check: { type: Type.NUMBER, description: 'Number of days to search (default 1, max 7)' }
       },
-      required: ['doctor_id', 'date']
+      required: ['doctor_id', 'start_date']
     }
   },
   {
@@ -63,7 +84,7 @@ export const TOOLS: FunctionDeclaration[] = [
   },
   {
     name: 'cancel_appointment',
-    description: 'Cancels an appointment and makes the slot available again.',
+    description: 'Cancels an existing appointment.',
     parameters: {
       type: Type.OBJECT,
       properties: {
@@ -74,21 +95,8 @@ export const TOOLS: FunctionDeclaration[] = [
     }
   },
   {
-    name: 'reschedule_appointment',
-    description: 'Changes the time of an existing appointment.',
-    parameters: {
-      type: Type.OBJECT,
-      properties: {
-        appointment_id: { type: Type.STRING },
-        new_slot_id: { type: Type.STRING },
-        type: { type: Type.STRING, enum: ['doctor', 'lab'] }
-      },
-      required: ['appointment_id', 'new_slot_id', 'type']
-    }
-  },
-  {
     name: 'get_opd_timings',
-    description: 'Get OPD timings for a specific department.',
+    description: 'Get schedule and timings for hospital departments.',
     parameters: {
       type: Type.OBJECT,
       properties: {
@@ -98,7 +106,7 @@ export const TOOLS: FunctionDeclaration[] = [
   },
   {
     name: 'hang_up',
-    description: 'Disconnects the voice call immediately.',
+    description: 'Ends the call session after the farewell message finishes playing.',
     parameters: { type: Type.OBJECT, properties: {} }
   }
 ];
