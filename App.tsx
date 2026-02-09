@@ -55,20 +55,21 @@ const App: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [isEmergency, setIsEmergency] = useState(false);
 
-  // Refs for audio hardware
+  // Hardware Refs
   const inputAudioContextRef = useRef<AudioContext | null>(null);
   const outputAudioContextRef = useRef<AudioContext | null>(null);
   const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   
-  // Refs for conversation state
+  // Session Refs
   const nextStartTimeRef = useRef(0);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const sessionRef = useRef<any>(null);
   const isStartingRef = useRef(false);
   const hangupPendingRef = useRef(false);
+  const heartbeatIntervalRef = useRef<number | null>(null);
 
-  // Call Summary Tracking Refs
+  // Summary Tracking
   const callStartTimeRef = useRef<Date | null>(null);
   const transcriptHistoryRef = useRef<{ role: 'user' | 'maya'; text: string }[]>([]);
   const currentTurnRef = useRef<{ user?: string; maya?: string }>({});
@@ -80,45 +81,48 @@ const App: React.FC = () => {
     ]);
   }, []);
 
+  const logTechnicalEvent = async (event: string, metadata: any = {}) => {
+    console.debug(`[MAYA-DEBUG] ${event}`, metadata);
+    try {
+      await supabase.from('maya_debug_logs').insert([{
+        event,
+        metadata,
+        patient_phone: patient?.phone || 'unknown',
+        timestamp: new Date().toISOString()
+      }]);
+    } catch (e) {
+      console.warn('Silent failure on debug log:', e);
+    }
+  };
+
   const saveCallSummary = async (techIssue: boolean = false) => {
     if (!callStartTimeRef.current || !patient) return;
 
     const endTime = new Date();
     const durationMs = endTime.getTime() - callStartTimeRef.current.getTime();
+    if (durationMs < 1000) return; 
+
     const durationSeconds = Math.floor(durationMs / 1000);
     const durationString = `${Math.floor(durationSeconds / 60)}m ${durationSeconds % 60}s`;
     
-    // Prepare conversation for AI summarization
     const fullTranscript = transcriptHistoryRef.current
       .map(entry => `${entry.role.toUpperCase()}: ${entry.text}`)
       .join('\n');
 
-    let summaryText = "Call ended before significant conversation.";
+    let summaryText = techIssue ? "Technical error reported during session." : "Brief session recorded.";
 
     if (transcriptHistoryRef.current.length > 0) {
       try {
         const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
         const response = await ai.models.generateContent({
           model: 'gemini-3-flash-preview',
-          contents: `Analyze this hospital call transcript and provide a brief summary including: 
-          1. Why the user called.
-          2. What the resolution was.
-          3. Mention any technical issues if detected or if the call ended abruptly.
-          
-          Transcript:
-          ${fullTranscript}
-          
-          ${techIssue ? 'NOTE: A technical socket error was reported during this call.' : ''}`,
-          config: {
-            systemInstruction: "You are a quality assurance auditor for a hospital. Keep summaries concise (max 3 sentences).",
-          }
+          contents: `Summarize this medical reception call. Intent? Resolution? Transcript: ${fullTranscript}`,
+          config: { systemInstruction: "Concise auditor. 2 sentences max." }
         });
-        summaryText = response.text || "Summary generation failed.";
+        summaryText = response.text || "Summary generated.";
       } catch (e) {
-        summaryText = "Technical failure during summary generation. Transcript available in debug logs.";
+        summaryText = "Transcript stored, summary generation failed.";
       }
-    } else if (techIssue) {
-      summaryText = "Technical issue prevented conversation from starting.";
     }
 
     try {
@@ -131,158 +135,147 @@ const App: React.FC = () => {
         call_summary: summaryText,
         tech_issue_detected: techIssue
       }]);
-      console.log('Call summary saved successfully.');
     } catch (dbErr) {
-      console.error('Failed to save call summary to database:', dbErr);
+      console.error('Summary DB error:', dbErr);
     }
   };
 
-  const stopAssistant = useCallback((techIssue: boolean = false) => {
-    // Save summary before cleaning up refs
+  const stopAssistant = useCallback(async (techIssue: boolean = false) => {
+    if (!isActive && !isStartingRef.current) return;
+    
+    logTechnicalEvent('Session Shutdown', { techIssue });
     saveCallSummary(techIssue);
     
-    for (const source of sourcesRef.current) {
-      try { source.stop(); } catch (e) {}
+    // Clear Intervals
+    if (heartbeatIntervalRef.current) {
+      clearInterval(heartbeatIntervalRef.current);
+      heartbeatIntervalRef.current = null;
     }
+
+    // Stop active audio sources
+    sourcesRef.current.forEach(source => {
+      try { source.stop(); } catch (e) {}
+    });
     sourcesRef.current.clear();
 
+    // Disconnect ScriptProcessor
     if (scriptProcessorRef.current) {
       scriptProcessorRef.current.disconnect();
       scriptProcessorRef.current.onaudioprocess = null;
       scriptProcessorRef.current = null;
     }
+
+    // Release Microphone
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach(track => track.stop());
       mediaStreamRef.current = null;
     }
 
+    // Close Socket
     if (sessionRef.current) {
-      try { sessionRef.current.close(); } catch(e) {}
+      try { await sessionRef.current.close(); } catch(e) {}
       sessionRef.current = null;
     }
-    if (inputAudioContextRef.current) {
-      inputAudioContextRef.current.close().catch(() => {});
-      inputAudioContextRef.current = null;
-    }
-    if (outputAudioContextRef.current) {
-      outputAudioContextRef.current.close().catch(() => {});
-      outputAudioContextRef.current = null;
+
+    // Close Audio Contexts (Critical for Second Call)
+    try {
+      if (inputAudioContextRef.current) {
+        await inputAudioContextRef.current.close();
+        inputAudioContextRef.current = null;
+      }
+      if (outputAudioContextRef.current) {
+        await outputAudioContextRef.current.close();
+        outputAudioContextRef.current = null;
+      }
+    } catch (e) {
+      console.warn('Error during context closure:', e);
     }
 
+    // Reset UI & State
     setIsActive(false);
     setBotState('idle');
     isStartingRef.current = false;
     hangupPendingRef.current = false;
     callStartTimeRef.current = null;
+    nextStartTimeRef.current = 0;
     transcriptHistoryRef.current = [];
-    addLog('Call completed.', 'info');
-  }, [addLog, patient]);
+    currentTurnRef.current = {};
+    addLog('Call disconnected.', techIssue ? 'error' : 'info');
+  }, [isActive, patient]);
 
   useEffect(() => {
-    return () => stopAssistant();
+    return () => { stopAssistant(); };
   }, [stopAssistant]);
 
   const toolHandlers = {
     update_patient_name: async (args: { name: string }) => {
-      if (!patient) return "ERROR: No patient session.";
-      addLog(`Updating record for: ${args.name}`, 'tool');
+      if (!patient) return "ERROR: No session.";
+      addLog(`Identifying as: ${args.name}`, 'tool');
       try {
-        const { error } = await supabase
-          .from('patients')
-          .update({ name: args.name })
-          .eq('phone', patient.phone);
-        
-        if (error) throw error;
+        const { error: dbError } = await supabase.from('patients').update({ name: args.name }).eq('phone', patient.phone);
+        if (dbError) throw dbError;
         setPatient(prev => prev ? ({ ...prev, name: args.name }) : null);
-        return "SUCCESS: Record updated. I will now refer to you as " + args.name;
-      } catch (err: any) {
-        return `ERROR: ${err.message}`;
-      }
+        return "SUCCESS: Record updated. I will call you " + args.name + " from now on.";
+      } catch (err: any) { return `ERROR: ${err.message}`; }
     },
     get_doctors: async () => {
-      addLog('Fetching provider list...', 'tool');
       const { data, error } = await supabase.from('doctors').select('*');
       return error ? `ERROR: ${error.message}` : data;
     },
     get_my_appointments: async () => {
-      if (!patient) return "ERROR: No session.";
-      addLog('Accessing your records...', 'tool');
-      const { data, error } = await supabase
-        .from('doctor_appointments')
-        .select('id, appointment_time, status, doctors(name, specialty)')
-        .eq('patient_phone', patient.phone)
-        .eq('status', 'scheduled');
+      const { data, error } = await supabase.from('doctor_appointments').select('id, appointment_time, status, doctors(name, specialty)').eq('patient_phone', patient?.phone).eq('status', 'scheduled');
       return error ? `ERROR: ${error.message}` : data;
     },
-    get_available_slots: async (args: { doctor_id: string; start_date: string; days_to_check?: number }) => {
+    get_available_slots: async (args: any) => {
       const days = Math.min(args.days_to_check || 1, 7);
-      addLog(`Checking next ${days} days...`, 'tool');
       const endDate = new Date(args.start_date);
       endDate.setDate(endDate.getDate() + days);
-      const { data, error } = await supabase
-        .from('doctor_slots')
-        .select('id, start_time')
-        .eq('doctor_id', args.doctor_id)
-        .eq('is_available', true)
-        .gte('start_time', `${args.start_date}T00:00:00Z`)
-        .lte('start_time', `${endDate.toISOString().split('T')[0]}T23:59:59Z`)
-        .order('start_time', { ascending: true })
-        .limit(20);
+      const { data, error } = await supabase.from('doctor_slots').select('id, start_time').eq('doctor_id', args.doctor_id).eq('is_available', true).gte('start_time', `${args.start_date}T00:00:00Z`).lte('start_time', `${endDate.toISOString().split('T')[0]}T23:59:59Z`).order('start_time', { ascending: true }).limit(20);
       return error ? `ERROR: ${error.message}` : data;
     },
-    book_appointment: async (args: { doctor_id: string; slot_id: string; time_string: string }) => {
-      addLog(`Reserving slot for ${args.time_string}...`, 'tool');
+    book_appointment: async (args: any) => {
       try {
-        const { data: appt, error: apptErr } = await supabase.from('doctor_appointments').insert([{ 
-          patient_phone: patient?.phone, doctor_id: args.doctor_id, appointment_time: args.time_string, status: 'scheduled' 
-        }]).select().single();
+        const { data: appt, error: apptErr } = await supabase.from('doctor_appointments').insert([{ patient_phone: patient?.phone, doctor_id: args.doctor_id, appointment_time: args.time_string, status: 'scheduled' }]).select().single();
         if (apptErr) throw apptErr;
         await supabase.from('doctor_slots').update({ is_available: false, booked_by_phone: patient?.phone, appointment_id: appt.id }).eq('id', args.slot_id);
         return `SUCCESS: Booked.`;
       } catch (err: any) { return `ERROR: ${err.message}`; }
     },
-    cancel_appointment: async (args: { appointment_id: string }) => {
-      addLog(`Cancelling booking...`, 'tool');
-      try {
-        await supabase.from('doctor_appointments').update({ status: 'cancelled' }).eq('id', args.appointment_id);
-        await supabase.from('doctor_slots').update({ is_available: true, booked_by_phone: null, appointment_id: null }).eq('appointment_id', args.appointment_id);
-        return "SUCCESS: Booking cancelled.";
-      } catch (err: any) { return `ERROR: ${err.message}`; }
-    },
-    get_opd_timings: async (args: { department?: string }) => {
-      addLog('Consulting department list...', 'tool');
+    get_opd_timings: async (args: any) => {
       let query = supabase.from('opd_timings').select('*');
       if (args.department) query = query.ilike('department', `%${args.department}%`);
       const { data, error } = await query;
       return error ? `ERROR: ${error.message}` : data;
     },
     hang_up: async () => {
-      addLog('Farewell pending...', 'info');
       hangupPendingRef.current = true;
-      setTimeout(() => {
-        if (hangupPendingRef.current) stopAssistant();
-      }, 5000);
-      return "SUCCESS: Hanging up after message.";
+      logTechnicalEvent('Hang Up Requested');
+      return "SUCCESS: Closing call.";
     }
   };
 
   const startAssistant = async () => {
     if (!patient || isStartingRef.current) return;
     
+    // Safety check: if an old context is lingering, kill it
+    if (isActive) await stopAssistant();
+    
     isStartingRef.current = true;
     setError(null);
     setIsEmergency(false);
-    transcriptHistoryRef.current = [];
-    currentTurnRef.current = {};
     
     try {
       setIsActive(true);
       setBotState('processing');
-      addLog('Waking Maya...', 'info');
+      logTechnicalEvent('Connection Initiated');
 
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      
       const inCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       const outCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      
+      await inCtx.resume();
+      await outCtx.resume();
       
       inputAudioContextRef.current = inCtx;
       outputAudioContextRef.current = outCtx;
@@ -296,8 +289,13 @@ const App: React.FC = () => {
           onopen: () => {
             callStartTimeRef.current = new Date();
             setBotState('listening');
-            addLog('Maya is ready.', 'info');
+            logTechnicalEvent('Connection Open');
             
+            // Start Heartbeat logging
+            heartbeatIntervalRef.current = window.setInterval(() => {
+              logTechnicalEvent('Heartbeat');
+            }, 10000);
+
             const source = inCtx.createMediaStreamSource(stream);
             const scriptProcessor = inCtx.createScriptProcessor(4096, 1, 1);
             scriptProcessorRef.current = scriptProcessor;
@@ -316,23 +314,17 @@ const App: React.FC = () => {
             scriptProcessor.connect(inCtx.destination);
           },
           onmessage: async (message: LiveServerMessage) => {
-            // Track Transcriptions for Summary
             if (message.serverContent?.outputTranscription) {
               const text = message.serverContent.outputTranscription.text;
               currentTurnRef.current.maya = (currentTurnRef.current.maya || '') + text;
               if (text.toLowerCase().includes('emergency')) setIsEmergency(true);
             } else if (message.serverContent?.inputTranscription) {
-              const text = message.serverContent.inputTranscription.text;
-              currentTurnRef.current.user = (currentTurnRef.current.user || '') + text;
+              currentTurnRef.current.user = (currentTurnRef.current.user || '') + message.serverContent.inputTranscription.text;
             }
 
             if (message.serverContent?.turnComplete) {
-              if (currentTurnRef.current.user) {
-                transcriptHistoryRef.current.push({ role: 'user', text: currentTurnRef.current.user });
-              }
-              if (currentTurnRef.current.maya) {
-                transcriptHistoryRef.current.push({ role: 'maya', text: currentTurnRef.current.maya });
-              }
+              if (currentTurnRef.current.user) transcriptHistoryRef.current.push({ role: 'user', text: currentTurnRef.current.user });
+              if (currentTurnRef.current.maya) transcriptHistoryRef.current.push({ role: 'maya', text: currentTurnRef.current.maya });
               currentTurnRef.current = {};
             }
 
@@ -341,6 +333,7 @@ const App: React.FC = () => {
               setBotState('speaking');
               const ctx = outputAudioContextRef.current;
               nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
+              
               const buffer = await decodeAudioData(decode(modelParts[0].inlineData.data), ctx, 24000, 1);
               const source = ctx.createBufferSource();
               source.buffer = buffer;
@@ -348,13 +341,12 @@ const App: React.FC = () => {
               
               source.onended = () => {
                 sourcesRef.current.delete(source);
-                if (sourcesRef.current.size === 0) {
-                  setBotState('listening');
-                  if (hangupPendingRef.current) {
-                    addLog('Farewell complete. Disconnecting.', 'info');
-                    stopAssistant();
+                setTimeout(() => {
+                  if (sourcesRef.current.size === 0) {
+                    setBotState('listening');
+                    if (hangupPendingRef.current) stopAssistant();
                   }
-                }
+                }, 400);
               };
 
               source.start(nextStartTimeRef.current);
@@ -372,16 +364,18 @@ const App: React.FC = () => {
             }
           },
           onerror: (e) => {
-            setError('Maya is experiencing high traffic. Please try again.');
+            logTechnicalEvent('Error', { msg: e.message });
+            setError('Maya is experiencing a glitch. Reconnecting...');
             stopAssistant(true);
           },
           onclose: (e) => {
-            stopAssistant();
+            logTechnicalEvent('Close', { code: e.code, reason: e.reason });
+            if (isActive) stopAssistant();
           }
         },
         config: {
           responseModalities: [Modality.AUDIO],
-          systemInstruction: SYSTEM_INSTRUCTION + `\n\nPatient Name: ${patient.name}\nPatient Phone: ${patient.phone}`,
+          systemInstruction: SYSTEM_INSTRUCTION + `\n\nPatient Name: ${patient.name}\nPhone: ${patient.phone}`,
           tools: [{ functionDeclarations: TOOLS }],
           outputAudioTranscription: {},
           inputAudioTranscription: {},
@@ -390,7 +384,8 @@ const App: React.FC = () => {
       });
       sessionRef.current = await sessionPromise;
     } catch (err: any) {
-      setError(`Hardware link failed: ${err.message}`);
+      logTechnicalEvent('Initialization Failure', { error: err.message });
+      setError(`Connection failed: ${err.message}`);
       stopAssistant(true);
     }
   };
@@ -409,9 +404,12 @@ const App: React.FC = () => {
         </div>
         {patient && (
           <div className="flex items-center space-x-4">
-            <span className="text-xs font-bold text-slate-500 hidden sm:inline-block">Logged in: <span className="text-slate-900">{patient.name}</span></span>
-            <button onClick={() => { setPatient(null); stopAssistant(); }} className="p-2 hover:bg-slate-100 rounded-lg">
-              <LogOut className="w-5 h-5 text-slate-400" />
+            <div className="flex flex-col items-end">
+              <span className="text-[10px] font-black text-slate-400 uppercase">Welcome back</span>
+              <span className="text-sm font-bold text-slate-900">{patient.name}</span>
+            </div>
+            <button onClick={() => { setPatient(null); stopAssistant(); }} className="p-2 hover:bg-rose-50 rounded-lg group transition-colors">
+              <LogOut className="w-5 h-5 text-slate-400 group-hover:text-rose-500" />
             </button>
           </div>
         )}
@@ -445,7 +443,7 @@ const App: React.FC = () => {
                       <p className="text-xs text-slate-500 mt-2">Ward & Lab directions.</p>
                     </div>
                   </div>
-                  <button onClick={startAssistant} className="inline-flex items-center justify-center px-10 py-5 font-black text-lg text-white bg-slate-900 rounded-[2rem] hover:bg-indigo-600 transition-all shadow-xl shadow-indigo-100/50">
+                  <button onClick={startAssistant} className="inline-flex items-center justify-center px-12 py-6 font-black text-xl text-white bg-slate-900 rounded-[2rem] hover:bg-indigo-600 transition-all shadow-2xl shadow-indigo-100/50 hover:scale-[1.02] active:scale-[0.98]">
                     <Mic className="w-6 h-6 mr-3" />
                     Connect to Maya
                   </button>
@@ -457,12 +455,12 @@ const App: React.FC = () => {
                     <div className="bg-white px-8 py-6 rounded-[2.5rem] border border-slate-200 shadow-2xl flex items-center space-x-6">
                       <div className={`w-3 h-3 rounded-full animate-pulse ${isEmergency ? 'bg-red-600' : 'bg-indigo-500'}`} />
                       <p className="text-lg text-slate-800 font-bold">
-                        {botState === 'listening' ? "Maya is listening..." : botState === 'speaking' ? "Maya is responding..." : "Processing..."}
+                        {botState === 'listening' ? "Maya is listening..." : botState === 'speaking' ? "Maya is responding..." : "Thinking..."}
                       </p>
                     </div>
-                    {error && <p className="text-rose-600 font-bold text-sm bg-rose-50 p-4 rounded-2xl border border-rose-100">{error}</p>}
-                    <button onClick={() => stopAssistant()} className="bg-slate-100 text-slate-600 px-8 py-4 rounded-full font-black text-sm hover:bg-rose-50 hover:text-rose-600 transition-all">
-                      Disconnect
+                    {error && <p className="text-rose-600 font-bold text-sm bg-rose-50 p-4 rounded-2xl border border-rose-100 animate-in slide-in-from-top-2">{error}</p>}
+                    <button onClick={() => stopAssistant()} className="bg-slate-100 text-slate-600 px-10 py-5 rounded-full font-black text-sm hover:bg-rose-50 hover:text-rose-600 transition-all shadow-sm">
+                      End Call
                     </button>
                   </div>
                 </div>
