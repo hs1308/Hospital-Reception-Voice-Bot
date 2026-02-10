@@ -67,7 +67,7 @@ const App: React.FC = () => {
   const sessionRef = useRef<any>(null);
   const isStartingRef = useRef(false);
   const hangupPendingRef = useRef(false);
-  const heartbeatIntervalRef = useRef<number | null>(null);
+  const isActiveRef = useRef(false); // Track state without triggering re-renders for cleanup
 
   // Summary Tracking
   const callStartTimeRef = useRef<Date | null>(null);
@@ -82,6 +82,9 @@ const App: React.FC = () => {
   }, []);
 
   const logTechnicalEvent = async (event: string, metadata: any = {}) => {
+    // Only log if it's not a repetitive heartbeat to keep DB clean
+    if (event === 'Heartbeat') return; 
+    
     console.debug(`[MAYA-DEBUG] ${event}`, metadata);
     try {
       await supabase.from('maya_debug_logs').insert([{
@@ -100,7 +103,7 @@ const App: React.FC = () => {
 
     const endTime = new Date();
     const durationMs = endTime.getTime() - callStartTimeRef.current.getTime();
-    if (durationMs < 1000) return; 
+    if (durationMs < 1500) return; 
 
     const durationSeconds = Math.floor(durationMs / 1000);
     const durationString = `${Math.floor(durationSeconds / 60)}m ${durationSeconds % 60}s`;
@@ -109,19 +112,19 @@ const App: React.FC = () => {
       .map(entry => `${entry.role.toUpperCase()}: ${entry.text}`)
       .join('\n');
 
-    let summaryText = techIssue ? "Technical error reported during session." : "Brief session recorded.";
+    let summaryText = techIssue ? "Technical error reported during session." : "Call ended abruptly or too short for summary.";
 
     if (transcriptHistoryRef.current.length > 0) {
       try {
         const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
         const response = await ai.models.generateContent({
           model: 'gemini-3-flash-preview',
-          contents: `Summarize this medical reception call. Intent? Resolution? Transcript: ${fullTranscript}`,
-          config: { systemInstruction: "Concise auditor. 2 sentences max." }
+          contents: `Provide a 1-sentence summary of this medical reception call based on this transcript: ${fullTranscript}`,
+          config: { systemInstruction: "Concise medical receptionist auditor." }
         });
         summaryText = response.text || "Summary generated.";
       } catch (e) {
-        summaryText = "Transcript stored, summary generation failed.";
+        summaryText = "Transcript recorded, AI summary failed.";
       }
     }
 
@@ -141,57 +144,54 @@ const App: React.FC = () => {
   };
 
   const stopAssistant = useCallback(async (techIssue: boolean = false) => {
-    if (!isActive && !isStartingRef.current) return;
+    // Check if we are actually active or starting
+    if (!isActiveRef.current && !isStartingRef.current) return;
     
     logTechnicalEvent('Session Shutdown', { techIssue });
     saveCallSummary(techIssue);
     
-    // Clear Intervals
-    if (heartbeatIntervalRef.current) {
-      clearInterval(heartbeatIntervalRef.current);
-      heartbeatIntervalRef.current = null;
-    }
-
-    // Stop active audio sources
+    // 1. Stop active audio sources
     sourcesRef.current.forEach(source => {
       try { source.stop(); } catch (e) {}
     });
     sourcesRef.current.clear();
 
-    // Disconnect ScriptProcessor
+    // 2. Disconnect ScriptProcessor
     if (scriptProcessorRef.current) {
-      scriptProcessorRef.current.disconnect();
-      scriptProcessorRef.current.onaudioprocess = null;
+      try {
+        scriptProcessorRef.current.disconnect();
+        scriptProcessorRef.current.onaudioprocess = null;
+      } catch (e) {}
       scriptProcessorRef.current = null;
     }
 
-    // Release Microphone
+    // 3. Release Microphone
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach(track => track.stop());
       mediaStreamRef.current = null;
     }
 
-    // Close Socket
+    // 4. Close Socket
     if (sessionRef.current) {
       try { await sessionRef.current.close(); } catch(e) {}
       sessionRef.current = null;
     }
 
-    // Close Audio Contexts (Critical for Second Call)
+    // 5. Explicitly close Audio Contexts
     try {
-      if (inputAudioContextRef.current) {
+      if (inputAudioContextRef.current && inputAudioContextRef.current.state !== 'closed') {
         await inputAudioContextRef.current.close();
-        inputAudioContextRef.current = null;
       }
-      if (outputAudioContextRef.current) {
+      if (outputAudioContextRef.current && outputAudioContextRef.current.state !== 'closed') {
         await outputAudioContextRef.current.close();
-        outputAudioContextRef.current = null;
       }
-    } catch (e) {
-      console.warn('Error during context closure:', e);
-    }
+    } catch (e) {}
+    
+    inputAudioContextRef.current = null;
+    outputAudioContextRef.current = null;
 
-    // Reset UI & State
+    // 6. Reset State
+    isActiveRef.current = false;
     setIsActive(false);
     setBotState('idle');
     isStartingRef.current = false;
@@ -200,22 +200,23 @@ const App: React.FC = () => {
     nextStartTimeRef.current = 0;
     transcriptHistoryRef.current = [];
     currentTurnRef.current = {};
-    addLog('Call disconnected.', techIssue ? 'error' : 'info');
-  }, [isActive, patient]);
+    addLog('Maya disconnected.', techIssue ? 'error' : 'info');
+  }, [patient]); // Minimal dependencies
 
   useEffect(() => {
-    return () => { stopAssistant(); };
-  }, [stopAssistant]);
+    // Only cleanup on real unmount
+    return () => {
+      if (isActiveRef.current) stopAssistant();
+    };
+  }, []); // Run only once
 
   const toolHandlers = {
     update_patient_name: async (args: { name: string }) => {
       if (!patient) return "ERROR: No session.";
-      addLog(`Identifying as: ${args.name}`, 'tool');
       try {
-        const { error: dbError } = await supabase.from('patients').update({ name: args.name }).eq('phone', patient.phone);
-        if (dbError) throw dbError;
+        await supabase.from('patients').update({ name: args.name }).eq('phone', patient.phone);
         setPatient(prev => prev ? ({ ...prev, name: args.name }) : null);
-        return "SUCCESS: Record updated. I will call you " + args.name + " from now on.";
+        return "SUCCESS: I will call you " + args.name + " from now on.";
       } catch (err: any) { return `ERROR: ${err.message}`; }
     },
     get_doctors: async () => {
@@ -249,7 +250,7 @@ const App: React.FC = () => {
     },
     hang_up: async () => {
       hangupPendingRef.current = true;
-      logTechnicalEvent('Hang Up Requested');
+      logTechnicalEvent('Hang Up Protocol Triggered');
       return "SUCCESS: Closing call.";
     }
   };
@@ -257,8 +258,8 @@ const App: React.FC = () => {
   const startAssistant = async () => {
     if (!patient || isStartingRef.current) return;
     
-    // Safety check: if an old context is lingering, kill it
-    if (isActive) await stopAssistant();
+    // Ensure clean slate
+    if (isActiveRef.current) await stopAssistant();
     
     isStartingRef.current = true;
     setError(null);
@@ -266,8 +267,9 @@ const App: React.FC = () => {
     
     try {
       setIsActive(true);
+      isActiveRef.current = true;
       setBotState('processing');
-      logTechnicalEvent('Connection Initiated');
+      logTechnicalEvent('Connection Initialized');
 
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       
@@ -289,18 +291,14 @@ const App: React.FC = () => {
           onopen: () => {
             callStartTimeRef.current = new Date();
             setBotState('listening');
-            logTechnicalEvent('Connection Open');
+            logTechnicalEvent('Socket Open Success');
             
-            // Start Heartbeat logging
-            heartbeatIntervalRef.current = window.setInterval(() => {
-              logTechnicalEvent('Heartbeat');
-            }, 10000);
-
             const source = inCtx.createMediaStreamSource(stream);
             const scriptProcessor = inCtx.createScriptProcessor(4096, 1, 1);
             scriptProcessorRef.current = scriptProcessor;
             
             scriptProcessor.onaudioprocess = (e) => {
+              if (!isActiveRef.current) return;
               const inputData = e.inputBuffer.getChannelData(0);
               const int16 = new Int16Array(inputData.length);
               for (let i = 0; i < inputData.length; i++) {
@@ -341,12 +339,10 @@ const App: React.FC = () => {
               
               source.onended = () => {
                 sourcesRef.current.delete(source);
-                setTimeout(() => {
-                  if (sourcesRef.current.size === 0) {
-                    setBotState('listening');
-                    if (hangupPendingRef.current) stopAssistant();
-                  }
-                }, 400);
+                if (sourcesRef.current.size === 0) {
+                  setBotState('listening');
+                  if (hangupPendingRef.current) stopAssistant();
+                }
               };
 
               source.start(nextStartTimeRef.current);
@@ -364,13 +360,13 @@ const App: React.FC = () => {
             }
           },
           onerror: (e) => {
-            logTechnicalEvent('Error', { msg: e.message });
-            setError('Maya is experiencing a glitch. Reconnecting...');
+            logTechnicalEvent('Socket Error Event', { msg: e.message });
+            setError('Maya is experiencing a delay. Please try connecting again.');
             stopAssistant(true);
           },
           onclose: (e) => {
-            logTechnicalEvent('Close', { code: e.code, reason: e.reason });
-            if (isActive) stopAssistant();
+            logTechnicalEvent('Socket Closed Event', { code: e.code, reason: e.reason });
+            if (isActiveRef.current) stopAssistant();
           }
         },
         config: {
@@ -383,9 +379,10 @@ const App: React.FC = () => {
         }
       });
       sessionRef.current = await sessionPromise;
+      isStartingRef.current = false;
     } catch (err: any) {
-      logTechnicalEvent('Initialization Failure', { error: err.message });
-      setError(`Connection failed: ${err.message}`);
+      logTechnicalEvent('Start Failure', { error: err.message });
+      setError(`Could not wake Maya: ${err.message}`);
       stopAssistant(true);
     }
   };
@@ -405,10 +402,10 @@ const App: React.FC = () => {
         {patient && (
           <div className="flex items-center space-x-4">
             <div className="flex flex-col items-end">
-              <span className="text-[10px] font-black text-slate-400 uppercase">Welcome back</span>
+              <span className="text-[10px] font-black text-slate-400 uppercase">Hospital ID Sync</span>
               <span className="text-sm font-bold text-slate-900">{patient.name}</span>
             </div>
-            <button onClick={() => { setPatient(null); stopAssistant(); }} className="p-2 hover:bg-rose-50 rounded-lg group transition-colors">
+            <button onClick={() => { stopAssistant(); setPatient(null); }} className="p-2 hover:bg-rose-50 rounded-lg group transition-colors">
               <LogOut className="w-5 h-5 text-slate-400 group-hover:text-rose-500" />
             </button>
           </div>
@@ -425,22 +422,25 @@ const App: React.FC = () => {
             <div className="flex-1 flex flex-col items-center justify-center p-8 text-center max-w-4xl mx-auto w-full">
               {!isActive ? (
                 <div className="w-full space-y-12 animate-in fade-in slide-in-from-bottom-4 duration-500">
-                  <h2 className="text-4xl font-black text-slate-900">Hello, <span className="text-indigo-600">{patient.name}</span>.</h2>
+                  <div className="space-y-4">
+                    <h2 className="text-4xl font-black text-slate-900">Welcome, <span className="text-indigo-600">{patient.name}</span>.</h2>
+                    <p className="text-slate-500 font-medium">How can our team help you today?</p>
+                  </div>
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                     <div className="bg-white p-8 rounded-[2.5rem] border border-slate-100 shadow-sm text-left group hover:border-indigo-200 transition-all cursor-pointer">
                       <Calendar className="w-8 h-8 text-blue-500 mb-4" />
                       <h3 className="font-bold text-slate-800">Booking</h3>
-                      <p className="text-xs text-slate-500 mt-2">Specialist appointments.</p>
+                      <p className="text-xs text-slate-500 mt-2">Manage appointments with ease.</p>
                     </div>
                     <div className="bg-white p-8 rounded-[2.5rem] border border-slate-100 shadow-sm text-left group hover:border-emerald-200 transition-all cursor-pointer">
                       <Search className="w-8 h-8 text-emerald-500 mb-4" />
                       <h3 className="font-bold text-slate-800">Timings</h3>
-                      <p className="text-xs text-slate-500 mt-2">OPD schedule info.</p>
+                      <p className="text-xs text-slate-500 mt-2">Check OPD schedules.</p>
                     </div>
                     <div className="bg-white p-8 rounded-[2.5rem] border border-slate-100 shadow-sm text-left group hover:border-orange-200 transition-all cursor-pointer">
                       <MapPin className="w-8 h-8 text-orange-500 mb-4" />
                       <h3 className="font-bold text-slate-800">Locate</h3>
-                      <p className="text-xs text-slate-500 mt-2">Ward & Lab directions.</p>
+                      <p className="text-xs text-slate-500 mt-2">Find wards and labs.</p>
                     </div>
                   </div>
                   <button onClick={startAssistant} className="inline-flex items-center justify-center px-12 py-6 font-black text-xl text-white bg-slate-900 rounded-[2rem] hover:bg-indigo-600 transition-all shadow-2xl shadow-indigo-100/50 hover:scale-[1.02] active:scale-[0.98]">
@@ -455,7 +455,7 @@ const App: React.FC = () => {
                     <div className="bg-white px-8 py-6 rounded-[2.5rem] border border-slate-200 shadow-2xl flex items-center space-x-6">
                       <div className={`w-3 h-3 rounded-full animate-pulse ${isEmergency ? 'bg-red-600' : 'bg-indigo-500'}`} />
                       <p className="text-lg text-slate-800 font-bold">
-                        {botState === 'listening' ? "Maya is listening..." : botState === 'speaking' ? "Maya is responding..." : "Thinking..."}
+                        {botState === 'listening' ? "Maya is listening..." : botState === 'speaking' ? "Maya is responding..." : "Working..."}
                       </p>
                     </div>
                     {error && <p className="text-rose-600 font-bold text-sm bg-rose-50 p-4 rounded-2xl border border-rose-100 animate-in slide-in-from-top-2">{error}</p>}
