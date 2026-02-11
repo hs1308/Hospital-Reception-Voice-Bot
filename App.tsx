@@ -67,7 +67,7 @@ const App: React.FC = () => {
         type,
         timestamp: new Date().toISOString()
       }]);
-    } catch (e) { console.error(e); }
+    } catch (e) { console.error('Log Persist Error:', e); }
   }, []);
 
   const addActionLog = useCallback((message: string, type: 'tool' | 'info' | 'error' = 'info') => {
@@ -77,22 +77,35 @@ const App: React.FC = () => {
   }, [patient, persistLog]);
 
   const fetchData = useCallback(async (patientId: string) => {
+    if (!isSupabaseConfigured()) return;
+    
     // Fetch Appointments
-    const { data: apptData } = await supabase
+    const { data: apptData, error: apptError } = await supabase
       .from('appointments')
       .select('*')
       .eq('patient_id', patientId)
       .order('appointment_time', { ascending: false });
-    if (apptData) setAppointments(apptData);
+    
+    if (apptError) {
+      addActionLog('Error fetching appointments: ' + apptError.message, 'error');
+    } else if (apptData) {
+      setAppointments(apptData);
+      addActionLog(`Synced ${apptData.length} appointments from database`, 'info');
+    }
 
     // Fetch Summaries
-    const { data: summaryData } = await supabase
+    const { data: summaryData, error: summaryError } = await supabase
       .from('user_chat_summaries')
       .select('*')
       .eq('patient_id', patientId)
       .order('timestamp', { ascending: false });
-    if (summaryData) setSummaries(summaryData);
-  }, []);
+    
+    if (summaryError) {
+      addActionLog('Error fetching summaries: ' + summaryError.message, 'error');
+    } else if (summaryData) {
+      setSummaries(summaryData);
+    }
+  }, [addActionLog]);
 
   useEffect(() => {
     if (patient) fetchData(patient.id);
@@ -144,9 +157,12 @@ const App: React.FC = () => {
     };
 
     const { data, error } = await supabase.from('appointments').insert([newAppointment]).select().single();
-    if (error) return "Booking failed: " + error.message;
+    if (error) {
+      addActionLog(`Booking failed: ${error.message}`, 'error');
+      return "Booking failed: " + error.message;
+    }
 
-    setAppointments(prev => [data, ...prev]);
+    setAppointments(prev => [data, ...prev].sort((a, b) => new Date(b.appointment_time).getTime() - new Date(a.appointment_time).getTime()));
     addActionLog(`Booked new appointment for ${data.department}`, 'tool');
     return `Confirmed: ${data.department} at ${new Date(data.appointment_time).toLocaleString()}`;
   };
@@ -169,7 +185,7 @@ const App: React.FC = () => {
       };
       const { data } = await supabase.from('user_chat_summaries').insert([newSummary]).select().single();
       if (data) setSummaries(prev => [data, ...prev]);
-    } catch (e) { console.error(e); }
+    } catch (e) { console.error('Summary Save Error:', e); }
   };
 
   useEffect(() => {
@@ -200,6 +216,10 @@ const App: React.FC = () => {
 
   const startMaya = async () => {
     if (isMayaActive) return;
+    
+    // Refresh data right before session to give Maya current state
+    if (patient) await fetchData(patient.id);
+
     setIsMayaActive(true);
     setBotState('initiating');
     setSessionStartTime(Date.now());
@@ -249,34 +269,45 @@ const App: React.FC = () => {
               const startTime = Math.max(nextStartTimeRef.current, outCtx.currentTime);
               source.start(startTime);
               nextStartTimeRef.current = startTime + buffer.duration;
-              sourcesRef.add(source);
+              sourcesRef.current.add(source);
             }
 
             if (msg.toolCall?.functionCalls) {
               for (const fc of msg.toolCall.functionCalls) {
                 let result: any = "OK";
-                if (fc.name === 'book_appointment') result = await bookAppointment(fc.args);
-                else if (fc.name === 'reschedule_appointment') result = await rescheduleAppointment(fc.args.appointment_id, fc.args.new_appointment_time);
-                else if (fc.name === 'cancel_appointment') result = await cancelAppointment(fc.args.appointment_id);
-                else if (fc.name === 'hang_up') stopMaya();
-                else if (fc.name === 'get_patient_appointments') result = appointments.map(a => `[ID: ${a.id}] ${a.department} w/ ${a.doctor_name} on ${new Date(a.appointment_time).toLocaleString()}`).join('\n');
+                if (fc.name === 'book_appointment') {
+                  result = await bookAppointment(fc.args);
+                } else if (fc.name === 'reschedule_appointment') {
+                  result = await rescheduleAppointment(fc.args.appointment_id, fc.args.new_appointment_time);
+                } else if (fc.name === 'cancel_appointment') {
+                  result = await cancelAppointment(fc.args.appointment_id);
+                } else if (fc.name === 'hang_up') {
+                  stopMaya();
+                } else if (fc.name === 'get_patient_appointments') {
+                  result = appointments.length > 0 
+                    ? appointments.map(a => `[ID: ${a.id}] ${a.department} w/ ${a.doctor_name} on ${new Date(a.appointment_time).toLocaleString()} (Status: ${a.status})`).join('\n')
+                    : "No appointments found for this patient.";
+                }
                 
                 sessionPromise.then(s => s.sendToolResponse({ functionResponses: { id: fc.id, name: fc.name, response: { result } } }));
               }
             }
           },
-          onerror: (e) => { console.error(e); stopMaya(); },
+          onerror: (e) => { console.error('Maya session error:', e); stopMaya(); },
           onclose: () => stopMaya()
         },
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } },
-          systemInstruction: SYSTEM_INSTRUCTION + `\n\nPatient: ${patient?.name}\nAppointments: ${JSON.stringify(appointments)}`,
+          systemInstruction: SYSTEM_INSTRUCTION + `\n\nCURRENT CONTEXT:\nPatient: ${patient?.name}\nToday is: ${new Date().toLocaleString()}\nAppointments: ${JSON.stringify(appointments)}`,
           tools: [{ functionDeclarations: TOOLS }]
         }
       });
       sessionRef.current = await sessionPromise;
-    } catch (e: any) { stopMaya(); }
+    } catch (e: any) { 
+      addActionLog('Critical failure: ' + e.message, 'error');
+      stopMaya(); 
+    }
   };
 
   const now = new Date();
@@ -286,17 +317,17 @@ const App: React.FC = () => {
   if (!patient) return <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6"><PatientSetup onComplete={setPatient} /></div>;
 
   return (
-    <div className="min-h-screen bg-[#FDFDFE] flex flex-col overflow-hidden text-slate-900">
+    <div className="h-screen bg-[#FDFDFE] flex flex-col overflow-hidden text-slate-900">
       {/* Global Connectivity Warnings */}
       {!isSupabaseConfigured() && (
-        <div className="bg-amber-500 text-white px-6 py-2 flex items-center justify-center space-x-2 text-xs font-black uppercase tracking-widest z-50">
+        <div className="bg-amber-500 text-white px-6 py-2 flex items-center justify-center space-x-2 text-xs font-black uppercase tracking-widest z-50 shrink-0">
           <WifiOff className="w-4 h-4" />
           <span>Database Keys Missing - Records will not persist</span>
         </div>
       )}
 
       {/* Header */}
-      <header className="px-8 py-6 border-b border-slate-100 flex items-center justify-between bg-white sticky top-0 z-40">
+      <header className="px-8 py-6 border-b border-slate-100 flex items-center justify-between bg-white shrink-0 z-40">
         <div className="flex items-center space-x-4">
           <div className="bg-indigo-600 p-3 rounded-2xl shadow-lg shadow-indigo-100">
             <HeartPulse className="w-6 h-6 text-white" />
@@ -317,7 +348,8 @@ const App: React.FC = () => {
         </div>
       </header>
 
-      <div className="flex-1 overflow-y-auto">
+      {/* Main Content Area - SCROLLABLE */}
+      <main className="flex-1 overflow-y-auto scroll-smooth">
         <div className="max-w-6xl mx-auto p-8 space-y-12">
           
           {/* Hero: Maya Interaction */}
@@ -338,7 +370,7 @@ const App: React.FC = () => {
                     <span>Talk to Maya</span>
                   </button>
                 </div>
-                <div className="w-64 h-64 bg-slate-50 rounded-[4rem] border-2 border-dashed border-slate-200 flex items-center justify-center relative overflow-hidden group">
+                <div className="w-64 h-64 bg-slate-50 rounded-[4rem] border-2 border-dashed border-slate-200 flex items-center justify-center relative overflow-hidden group shrink-0">
                    <div className="absolute inset-0 bg-indigo-500/5 opacity-0 group-hover:opacity-100 transition-opacity" />
                    <Mic className="w-20 h-20 text-slate-200 group-hover:text-indigo-200 transition-colors" />
                 </div>
@@ -480,7 +512,7 @@ const App: React.FC = () => {
           </section>
 
         </div>
-      </div>
+      </main>
 
       {/* Floating Action Log Toggle (Desktop only for debugging) */}
       <div className="fixed bottom-8 right-8 z-50 group">
