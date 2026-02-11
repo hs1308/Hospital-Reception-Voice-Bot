@@ -41,7 +41,21 @@ async function decodeAudioData(data: Uint8Array, ctx: AudioContext, sampleRate: 
   return buffer;
 }
 
-// Unified IST Formatter
+// Format as "Feb 20, 5:30 PM" in IST
+const formatFriendlyIST = (dateStr: string | undefined) => {
+  if (!dateStr) return 'N/A';
+  const date = new Date(dateStr);
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Kolkata',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: true
+  }).format(date).replace(' at ', ', ');
+};
+
+// Keep old formatter for DD/MM/YYYY if needed elsewhere
 const formatIST = (dateStr: string | undefined, includeTime: boolean = false) => {
   if (!dateStr) return 'N/A';
   const date = new Date(dateStr);
@@ -286,7 +300,7 @@ const App: React.FC = () => {
                   const { data, error } = await supabase.from('doctor_appointments').insert([newAppt]).select('*, doctors(*)').single();
                   if (data) {
                     setAppointments(prev => [data as any, ...prev]);
-                    result = `Success: Appointment booked for ${formatIST(data.appointment_time, true)}`;
+                    result = `Success: Appointment booked for ${formatFriendlyIST(data.appointment_time)}`;
                     addActionLog(`Maya booked Doctor visit`, 'tool');
                   } else result = `Error: ${error?.message}`;
                 }
@@ -300,7 +314,7 @@ const App: React.FC = () => {
                   const { data, error } = await supabase.from('lab_appointments').insert([newAppt]).select('*, labs(*)').single();
                   if (data) {
                     setAppointments(prev => [data as any, ...prev]);
-                    result = `Success: Lab test booked for ${formatIST(data.appointment_time, true)}`;
+                    result = `Success: Lab test booked for ${formatFriendlyIST(data.appointment_time)}`;
                     addActionLog(`Maya booked Lab test`, 'tool');
                   } else result = `Error: ${error?.message}`;
                 }
@@ -336,7 +350,7 @@ const App: React.FC = () => {
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } },
-          systemInstruction: SYSTEM_INSTRUCTION + `\n\nUSER CONTEXT:\nName: ${patient.name}\nPhone: ${patient.phone}\nHospital Time (IST): ${formatIST(new Date().toISOString(), true)}`,
+          systemInstruction: SYSTEM_INSTRUCTION + `\n\nUSER CONTEXT:\nName: ${patient.name}\nPhone: ${patient.phone}\nHospital Time (IST): ${formatFriendlyIST(new Date().toISOString())}`,
           tools: [{ functionDeclarations: TOOLS }],
           inputAudioTranscription: {},
           outputAudioTranscription: {}
@@ -382,18 +396,22 @@ const App: React.FC = () => {
           <section className="relative">
             {!isMayaActive ? (
               <div className="bg-white rounded-2xl p-6 border border-slate-100 shadow-lg flex flex-col md:flex-row items-center justify-between space-y-4 md:space-y-0 md:space-x-8 animate-in fade-in slide-in-from-bottom-4">
-                <div className="flex-1 space-y-3 text-center md:text-left">
+                <div className="flex-1 space-y-3 order-2 md:order-1 text-center md:text-left">
                   <div className="inline-flex items-center px-3 py-1 bg-indigo-50 text-indigo-600 rounded-full text-[9px] font-black uppercase tracking-widest">
                     <Mic className="w-2.5 h-2.5 mr-1.5" /> Live Database Access
                   </div>
-                  <p className="text-base text-slate-500 font-medium leading-normal max-w-xl">
+                  {/* Reduced description font size */}
+                  <p className="text-[15px] text-slate-500 font-medium leading-normal max-w-xl">
                     Talk to Receptionist Maya to browse OPD, doctors, labs; schedule appointments or lab tests, manage visits.
                   </p>
+                </div>
+                <div className="order-1 md:order-2 shrink-0">
+                  {/* Increased CTA font size */}
                   <button 
                     onClick={startMaya}
-                    className="flex items-center space-x-3 bg-slate-900 hover:bg-indigo-600 text-white px-6 py-3.5 rounded-xl font-black text-sm transition-all shadow-lg group mx-auto md:mx-0"
+                    className="flex items-center space-x-3 bg-slate-900 hover:bg-indigo-600 text-white px-8 py-4 rounded-xl font-black text-base transition-all shadow-xl group mx-auto md:mx-0"
                   >
-                    <Mic className="w-4 h-4 group-hover:scale-110 transition-transform" />
+                    <Mic className="w-5 h-5 group-hover:scale-110 transition-transform" />
                     <span>Talk to Maya</span>
                   </button>
                 </div>
@@ -425,19 +443,20 @@ const App: React.FC = () => {
                   upcoming.map(app => (
                     <div key={app.id} className="bg-white border border-slate-100 p-4 rounded-xl flex items-center justify-between hover:shadow-md transition-all group">
                       <div className="flex items-center space-x-4 min-w-0">
-                        <div className="w-10 h-10 rounded-lg bg-indigo-50 flex items-center justify-center text-indigo-600 shrink-0">
-                          {app.lab_id ? <FlaskConical className="w-5 h-5" /> : <User className="w-5 h-5" />}
+                        <div className="w-11 h-11 rounded-lg bg-indigo-50 flex items-center justify-center text-indigo-600 shrink-0">
+                          {app.lab_id ? <FlaskConical className="w-6 h-6" /> : <User className="w-6 h-6" />}
                         </div>
                         <div className="min-w-0">
-                          <h4 className="font-bold text-slate-900 text-sm truncate">
+                          {/* Elements font size increased by 1pt */}
+                          <h4 className="font-bold text-slate-900 text-base truncate leading-tight">
                             {app.doctors?.name || app.labs?.test_name || 'Medical Visit'}
                           </h4>
-                          <p className="text-[10px] font-black text-indigo-600 uppercase tracking-tight mt-0.5">
-                            {formatIST(app.appointment_time, true)}
+                          <p className="text-xs font-black text-indigo-600 uppercase tracking-tight mt-1">
+                            {formatFriendlyIST(app.appointment_time)}
                           </p>
                         </div>
                       </div>
-                      <ChevronRight className="w-4 h-4 text-slate-200 group-hover:text-indigo-400 group-hover:translate-x-1 transition-all" />
+                      <ChevronRight className="w-5 h-5 text-slate-200 group-hover:text-indigo-400 group-hover:translate-x-1 transition-all" />
                     </div>
                   ))
                 )}
@@ -455,13 +474,13 @@ const App: React.FC = () => {
                   past.map(app => (
                     <div key={app.id} className="bg-white/50 border border-slate-100 p-4 rounded-xl flex items-center justify-between opacity-75 hover:opacity-100 transition-all">
                       <div className="flex items-center space-x-4 min-w-0">
-                        <div className="w-10 h-10 rounded-lg bg-slate-50 flex items-center justify-center text-slate-400 shrink-0">
-                          {app.status === 'cancelled' ? <AlertCircle className="w-5 h-5" /> : <CheckCircle2 className="w-5 h-5" />}
+                        <div className="w-11 h-11 rounded-lg bg-slate-50 flex items-center justify-center text-slate-400 shrink-0">
+                          {app.status === 'cancelled' ? <AlertCircle className="w-6 h-6" /> : <CheckCircle2 className="w-6 h-6" />}
                         </div>
                         <div className="min-w-0">
-                          <h4 className="font-bold text-slate-600 text-sm truncate">{app.doctors?.name || app.labs?.test_name}</h4>
-                          <p className="text-[9px] font-black text-slate-400 uppercase tracking-tighter mt-0.5">
-                            {app.status.toUpperCase()} • {formatIST(app.appointment_time)}
+                          <h4 className="font-bold text-slate-600 text-base truncate leading-tight">{app.doctors?.name || app.labs?.test_name}</h4>
+                          <p className="text-xs font-black text-slate-400 uppercase tracking-tighter mt-1">
+                            {app.status.toUpperCase()} • {formatFriendlyIST(app.appointment_time)}
                           </p>
                         </div>
                       </div>
@@ -481,19 +500,18 @@ const App: React.FC = () => {
                 </div>
               ) : (
                 summaries.map(summary => (
-                  <div key={summary.call_id} className="bg-white border border-slate-100 p-5 rounded-xl space-y-3 hover:shadow-lg transition-all border-b-2 hover:border-indigo-200">
+                  <div key={summary.call_id} className="bg-white border border-slate-100 p-5 rounded-xl space-y-3 hover:shadow-lg transition-all border-b-2 hover:border-indigo-200 relative">
                     <div className="flex items-center justify-between">
                       <div className="p-2 bg-indigo-50 rounded-lg text-indigo-600"><MessageSquare className="w-3.5 h-3.5" /></div>
-                      <p className="text-[9px] font-black text-slate-400 uppercase">{formatIST(summary.created_at)}</p>
-                    </div>
-                    <div className="space-y-1">
-                      <p className="text-xs text-slate-700 font-medium italic leading-relaxed line-clamp-3">"{summary.call_summary}"</p>
-                      {/* Added start time specifically in summary card as requested */}
-                      <p className="text-[10px] font-black text-indigo-600 uppercase tracking-tight">
-                        Started: {formatIST(summary.start_time, true)}
+                      {/* Formatted Date/Time on top right */}
+                      <p className="text-[10px] font-black text-slate-400 uppercase tracking-tighter">
+                        {formatFriendlyIST(summary.start_time)}
                       </p>
                     </div>
-                    <div className="flex items-center text-[9px] font-black text-slate-400 uppercase tracking-tighter pt-1">
+                    <div className="space-y-2">
+                      <p className="text-xs text-slate-700 font-medium italic leading-relaxed line-clamp-4">"{summary.call_summary}"</p>
+                    </div>
+                    <div className="flex items-center text-[9px] font-black text-slate-400 uppercase tracking-tighter pt-1 border-t border-slate-50">
                       <Timer className="w-3 h-3 mr-1.5" /> {summary.duration}
                     </div>
                   </div>
