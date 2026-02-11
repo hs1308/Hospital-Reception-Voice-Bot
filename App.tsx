@@ -372,12 +372,19 @@ const App: React.FC = () => {
   const upcoming = appointments.filter(a => new Date(a.appointment_time) >= now && a.status === 'scheduled');
   const past = appointments.filter(a => new Date(a.appointment_time) < now || a.status !== 'scheduled');
 
-  if (!patient) return <div className="h-screen bg-slate-50 flex items-center justify-center p-6"><PatientSetup onComplete={handlePatientLogin} /></div>;
+  if (!patient) {
+    return (
+      <div className="min-h-screen bg-white flex items-start justify-center overflow-y-auto">
+        <div className="w-full">
+          <PatientSetup onComplete={handlePatientLogin} />
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div className="h-[100dvh] bg-[#FDFDFE] flex flex-col overflow-hidden text-slate-900">
-      {/* Header visibility fix for mobile: ensured bg and z-index, removed redundant sticky logic that often offsets on mobile Chrome */}
-      <header className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-white shrink-0 z-[60] shadow-sm">
+    <div className="min-h-screen bg-[#FDFDFE] flex flex-col text-slate-900">
+      <header className="sticky top-0 px-6 py-3 border-b border-slate-100 flex items-center justify-between bg-white/95 backdrop-blur-sm shrink-0 z-50 shadow-sm">
         <div className="flex items-center space-x-3">
           <div>
             <h1 className="text-base font-black leading-tight">Nurse Maya</h1>
@@ -390,29 +397,28 @@ const App: React.FC = () => {
             <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">{patient.phone}</p>
           </div>
           <button onClick={handleLogout} className="p-2 rounded-xl bg-slate-50 text-slate-400 hover:text-rose-500 transition-all">
-            <LogOut className="w-5 h-5" />
+            <LogOut className="w-4 h-4" />
           </button>
         </div>
       </header>
 
-      <main className="flex-1 overflow-y-auto scroll-smooth">
+      <main className="flex-1">
         <div className="max-w-5xl mx-auto p-4 sm:p-6 space-y-8 pb-32">
           
           <section className="relative">
             {!isMayaActive ? (
-              <div className="bg-white rounded-2xl p-6 sm:p-8 border border-slate-100 shadow-lg flex flex-col md:flex-row items-center justify-between space-y-8 md:space-y-0 md:space-x-8 animate-in fade-in slide-in-from-bottom-4">
-                <div className="flex-1 space-y-4 order-2 md:order-1 text-center md:text-left">
-                  {/* Spacing improved to prevent clumping. Font size kept at 14px as requested. */}
-                  <p className="text-[14px] text-slate-500 font-medium leading-relaxed max-w-xl">
+              <div className="bg-white rounded-2xl p-6 border border-slate-100 shadow-lg flex flex-col md:flex-row items-center justify-between space-y-6 md:space-y-0 md:space-x-8 animate-in fade-in slide-in-from-bottom-4">
+                <div className="flex-1 space-y-3 order-2 md:order-1 text-center md:text-left">
+                  <p className="text-[14px] text-slate-500 font-medium leading-normal max-w-xl">
                     Talk to Receptionist Maya to browse OPD, doctors, labs; schedule appointments or lab tests, manage visits.
                   </p>
                 </div>
                 <div className="order-1 md:order-2 shrink-0">
                   <button 
                     onClick={startMaya}
-                    className="flex items-center space-x-4 bg-slate-900 hover:bg-indigo-600 text-white px-10 py-5 rounded-2xl font-black text-[17.5px] transition-all shadow-xl group mx-auto md:mx-0 active:scale-95"
+                    className="flex items-center space-x-3 bg-slate-900 hover:bg-indigo-600 text-white px-8 py-4 rounded-xl font-black text-[17px] transition-all shadow-xl group mx-auto md:mx-0"
                   >
-                    <Mic className="w-6 h-6 group-hover:scale-110 transition-transform" />
+                    <Mic className="w-5 h-5 group-hover:scale-110 transition-transform" />
                     <span>Talk to Maya</span>
                   </button>
                 </div>
@@ -442,7 +448,7 @@ const App: React.FC = () => {
                   </div>
                 ) : (
                   upcoming.map(app => (
-                    <div key={app.id} className="bg-white border border-slate-100 p-4 rounded-xl flex items-center justify-between hover:shadow-md transition-all group active:bg-slate-50">
+                    <div key={app.id} className="bg-white border border-slate-100 p-4 rounded-xl flex items-center justify-between hover:shadow-md transition-all group">
                       <div className="flex items-center space-x-4 min-w-0">
                         <div className="w-11 h-11 rounded-lg bg-indigo-50 flex items-center justify-center text-indigo-600 shrink-0">
                           {app.lab_id ? <FlaskConical className="w-6 h-6" /> : <User className="w-6 h-6" />}
@@ -451,7 +457,7 @@ const App: React.FC = () => {
                           <h4 className="font-bold text-slate-900 text-[15px] truncate leading-tight">
                             {app.doctors?.name || app.labs?.test_name || 'Medical Visit'}
                           </h4>
-                          <p className="text-[11px] font-black text-indigo-600 uppercase tracking-tight mt-1.5">
+                          <p className="text-[11px] font-black text-indigo-600 uppercase tracking-tight mt-1">
                             {formatFriendlyIST(app.appointment_time)}
                           </p>
                         </div>
@@ -479,7 +485,7 @@ const App: React.FC = () => {
                         </div>
                         <div className="min-w-0">
                           <h4 className="font-bold text-slate-600 text-[15px] truncate leading-tight">{app.doctors?.name || app.labs?.test_name}</h4>
-                          <p className="text-[11px] font-black text-slate-400 uppercase tracking-tighter mt-1.5">
+                          <p className="text-[11px] font-black text-slate-400 uppercase tracking-tighter mt-1">
                             {app.status.toUpperCase()} • {formatFriendlyIST(app.appointment_time)}
                           </p>
                         </div>
@@ -510,10 +516,8 @@ const App: React.FC = () => {
                     <div className="space-y-2">
                       <p className="text-xs text-slate-700 font-medium italic leading-relaxed line-clamp-4">"{summary.call_summary}"</p>
                     </div>
-                    <div className="flex items-center justify-between pt-1 border-t border-slate-50">
-                      <div className="flex items-center text-[9px] font-black text-slate-400 uppercase tracking-tighter">
-                        <Timer className="w-3 h-3 mr-1.5" /> {summary.duration}
-                      </div>
+                    <div className="flex items-center text-[9px] font-black text-slate-400 uppercase tracking-tighter pt-1 border-t border-slate-50">
+                      <Timer className="w-3 h-3 mr-1.5" /> {summary.duration}
                     </div>
                   </div>
                 ))
@@ -530,7 +534,7 @@ const App: React.FC = () => {
             <ActionLog logs={actionLogs} />
           </div>
         </div>
-        <button className="bg-slate-900 text-white p-4 rounded-xl shadow-2xl hover:bg-indigo-600 transition-colors active:scale-95">
+        <button className="bg-slate-900 text-white p-4 rounded-xl shadow-2xl hover:bg-indigo-600 transition-colors">
           <Activity className="w-5 h-5" />
         </button>
       </div>
