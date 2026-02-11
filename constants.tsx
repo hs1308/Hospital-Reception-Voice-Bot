@@ -2,84 +2,50 @@
 import { FunctionDeclaration, Type } from '@google/genai';
 
 export const SYSTEM_INSTRUCTION = `
-# MAYA: HOSPITAL RECEPTIONIST PROTOCOL (v11.0)
+# NURSE MAYA: HOSPITAL FRONT DESK PROTOCOL
 
-## 1. IDENTITY & NEW PATIENT ONBOARDING
-- **Role:** Lead Receptionist at City Health Hospital, HSR Layout.
-- **Protocol for Generic Names:** If the patient's name is provided as "Patient [Last 4 Digits]", you MUST politely ask for their full name at the start of the conversation. 
-- **Action:** Once they provide their name, immediately call 'update_patient_name' to sync our records. Use their real name for the rest of the call.
+## 1. IDENTITY & GOAL
+- **Role:** You are Nurse Maya, a friendly and efficient front desk assistant at City General Hospital.
+- **Mission:** Help patients book appointments, reschedule existing ones, or cancel them.
 
-## 2. EFFICIENT SEARCH PROTOCOL
-- **Range Searching:** If a specific date is full, always use 'get_available_slots' with 'days_to_check: 7'.
-- **Dr. Priya Mani:** Highly requested. Always perform a 7-day check for her.
+## 2. BOOKING & MODIFICATION PROTOCOL
+- **Booking:** Use 'book_appointment' for NEW visits.
+- **Rescheduling:** If a patient wants to change an existing appointment, use 'reschedule_appointment'. You must identify which appointment to change (ask for the department or doctor if unclear).
+- **Cancellation:** Use 'cancel_appointment' to remove a booking.
+- **Verification:** Always confirm the new date and time before finalized changes.
 
-## 3. APPOINTMENT MANAGEMENT
-- **Confirmations:** Always repeat Date, Time, and Doctor name before finalizing.
-- **OPD:** Use 'get_opd_timings' for department hours.
+## 3. DEPARTMENTS
+- Cardiology, Pediatrics, Orthopedics, General Medicine.
 
-## 4. CALL TERMINATION PROTOCOL (STRICT)
-You must handle endings in these two specific ways:
-
-**Scenario A: User explicitly asks to end the call**
-1. Say exactly: "Thank you for calling, you can call me again if you need help in the future."
-2. Immediately call the 'hang_up' tool.
-
-**Scenario B: Request resolved**
-1. Ask: "Is there anything else I can help you with?"
-2. If the user says "No", ask: "Can I go ahead and end this call now?"
-3. If the user approves, say exactly: "Thank you for calling, you can call me again if you need help in the future."
-4. Immediately call the 'hang_up' tool.
-
-## 5. RELIABILITY & EMERGENCIES
-- For medical emergencies (Chest pain, etc.), immediately direct to ER or call 102.
+## 4. VOICE STYLE
+- Warm, reassuring, and professional.
 `;
 
 export const TOOLS: FunctionDeclaration[] = [
   {
-    name: 'update_patient_name',
-    description: 'Updates the patient name in the hospital database.',
-    parameters: {
-      type: Type.OBJECT,
-      properties: {
-        name: { type: Type.STRING, description: 'The full name provided by the user' }
-      },
-      required: ['name']
-    }
-  },
-  {
-    name: 'get_doctors',
-    description: 'Fetch list of all doctors and specialties.',
-    parameters: { type: Type.OBJECT, properties: {} }
-  },
-  {
-    name: 'get_my_appointments',
-    description: 'Fetch all scheduled appointments for the current patient.',
-    parameters: { type: Type.OBJECT, properties: {} }
-  },
-  {
-    name: 'get_available_slots',
-    description: 'Query availability for a doctor over a range of dates.',
-    parameters: {
-      type: Type.OBJECT,
-      properties: {
-        doctor_id: { type: Type.STRING },
-        start_date: { type: Type.STRING, description: 'YYYY-MM-DD' },
-        days_to_check: { type: Type.NUMBER, description: 'Number of days to search (default 1, max 7)' }
-      },
-      required: ['doctor_id', 'start_date']
-    }
-  },
-  {
     name: 'book_appointment',
-    description: 'Books a new doctor appointment.',
+    description: 'Books a new medical appointment.',
     parameters: {
       type: Type.OBJECT,
       properties: {
-        doctor_id: { type: Type.STRING },
-        slot_id: { type: Type.STRING },
-        time_string: { type: Type.STRING }
+        department: { type: Type.STRING },
+        doctor_name: { type: Type.STRING },
+        appointment_time: { type: Type.STRING },
+        reason: { type: Type.STRING }
       },
-      required: ['doctor_id', 'slot_id', 'time_string']
+      required: ['department', 'appointment_time']
+    }
+  },
+  {
+    name: 'reschedule_appointment',
+    description: 'Changes the time of an existing appointment.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        appointment_id: { type: Type.STRING, description: 'The unique ID of the appointment to change' },
+        new_appointment_time: { type: Type.STRING, description: 'The new ISO date/time string' }
+      },
+      required: ['appointment_id', 'new_appointment_time']
     }
   },
   {
@@ -88,25 +54,19 @@ export const TOOLS: FunctionDeclaration[] = [
     parameters: {
       type: Type.OBJECT,
       properties: {
-        appointment_id: { type: Type.STRING },
-        type: { type: Type.STRING, enum: ['doctor', 'lab'] }
+        appointment_id: { type: Type.STRING }
       },
-      required: ['appointment_id', 'type']
+      required: ['appointment_id']
     }
   },
   {
-    name: 'get_opd_timings',
-    description: 'Get schedule and timings for hospital departments.',
-    parameters: {
-      type: Type.OBJECT,
-      properties: {
-        department: { type: Type.STRING }
-      }
-    }
+    name: 'get_patient_appointments',
+    description: 'Retrieves all upcoming appointments for the patient.',
+    parameters: { type: Type.OBJECT, properties: {} }
   },
   {
     name: 'hang_up',
-    description: 'Ends the call session after the farewell message finishes playing.',
+    description: 'Ends the session.',
     parameters: { type: Type.OBJECT, properties: {} }
   }
 ];

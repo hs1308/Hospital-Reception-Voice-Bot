@@ -1,52 +1,38 @@
 
-export interface Doctor {
-  id: string;
-  name: string;
-  specialty: string;
-  fee: number;
-  bio?: string;
-}
-
-export interface DoctorSlot {
-  id: string;
-  doctor_id: string;
-  start_time: string;
-  is_available: boolean;
-  booked_by_phone?: string;
-  appointment_id?: string;
-}
-
-export interface LabSlot {
-  id: string;
-  lab_id: string;
-  slot_time: string;
-  is_available: boolean;
-  booked_by_phone?: string;
-  appointment_id?: string;
-}
-
 export interface Patient {
+  id: string;
   phone: string;
   name: string;
-  created_at: string;
-}
-
-export interface Lab {
-  id: string;
-  test_name: string;
-  instructions: string;
-  price: number;
+  created_at?: string;
 }
 
 export interface Appointment {
   id: string;
-  patient_phone: string;
-  doctor_id: string;
+  patient_id: string;
+  doctor_name: string;
+  department: string;
   appointment_time: string;
-  status: 'scheduled' | 'cancelled' | 'completed';
+  reason?: string;
+  status: 'scheduled' | 'completed' | 'cancelled';
 }
 
-export type BotState = 'idle' | 'listening' | 'speaking' | 'processing';
+export interface DebugLog {
+  id?: string;
+  patient_id?: string;
+  message: string;
+  type: 'tool' | 'info' | 'error';
+  timestamp: string;
+}
+
+export interface ChatSummary {
+  id?: string;
+  patient_id: string;
+  summary: string;
+  duration_seconds: number;
+  timestamp: string;
+}
+
+export type BotState = 'idle' | 'initiating' | 'listening' | 'speaking' | 'processing';
 
 export interface ActionLog {
   id: string;

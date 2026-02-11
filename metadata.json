@@ -1,6 +1,6 @@
 {
-  "name": "Nurse Maya: AI Health Assistant",
-  "description": "A voice-based IVR replacement for hospital appointment bookings and triage, powered by Gemini 2.0 Flash Live.",
+  "name": "Nurse Maya AI: Hospital Assistant",
+  "description": "A high-performance voice-enabled health assistant for booking hospital appointments and managing patient records.",
   "requestFramePermissions": [
     "microphone"
   ]

@@ -1,477 +1,334 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
-import { supabase } from './supabaseClient';
-import { Patient, BotState, ActionLog as LogType } from './types';
+import { supabase, isSupabaseConfigured } from './supabaseClient';
+import { Patient, Appointment, BotState, ActionLog as LogType, DebugLog, ChatSummary } from './types';
 import { SYSTEM_INSTRUCTION, TOOLS } from './constants';
+import PatientSetup from './components/PatientSetup';
 import PulseOrb from './components/PulseOrb';
 import ActionLog from './components/ActionLog';
-import PatientSetup from './components/PatientSetup';
-import { Mic, MicOff, LogOut, Activity, Calendar, Search, MapPin } from 'lucide-react';
+import { 
+  Calendar, Clock, User, 
+  Stethoscope, Phone, LogOut, 
+  Mic, HeartPulse, ShieldCheck,
+  ChevronRight, AlertCircle, CheckCircle2,
+  Activity, WifiOff, Volume2, Trash2
+} from 'lucide-react';
 
 function encode(bytes: Uint8Array) {
   let binary = '';
   const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
+  for (let i = 0; i < len; i++) binary += String.fromCharCode(bytes[i]);
   return btoa(binary);
 }
 
 function decode(base64: string) {
   const binaryString = atob(base64);
-  const len = binaryString.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
   return bytes;
 }
 
-async function decodeAudioData(
-  data: Uint8Array,
-  ctx: AudioContext,
-  sampleRate: number,
-  numChannels: number,
-): Promise<AudioBuffer> {
+async function decodeAudioData(data: Uint8Array, ctx: AudioContext, sampleRate: number, numChannels: number): Promise<AudioBuffer> {
   const dataInt16 = new Int16Array(data.buffer);
   const frameCount = dataInt16.length / numChannels;
   const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
-
   for (let channel = 0; channel < numChannels; channel++) {
     const channelData = buffer.getChannelData(channel);
-    for (let i = 0; i < frameCount; i++) {
-      channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
-    }
+    for (let i = 0; i < frameCount; i++) channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
   }
   return buffer;
 }
 
 const App: React.FC = () => {
   const [patient, setPatient] = useState<Patient | null>(null);
+  const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [botState, setBotState] = useState<BotState>('idle');
-  const [logs, setLogs] = useState<LogType[]>([]);
-  const [isActive, setIsActive] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [isEmergency, setIsEmergency] = useState(false);
+  const [actionLogs, setActionLogs] = useState<LogType[]>([]);
+  const [isMayaActive, setIsMayaActive] = useState(false);
+  const [noiseLevel, setNoiseLevel] = useState(0);
+  const [sessionStartTime, setSessionStartTime] = useState<number | null>(null);
 
-  // Hardware Refs
   const inputAudioContextRef = useRef<AudioContext | null>(null);
   const outputAudioContextRef = useRef<AudioContext | null>(null);
-  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
-  const mediaStreamRef = useRef<MediaStream | null>(null);
-  
-  // Session Refs
+  const sessionRef = useRef<any>(null);
   const nextStartTimeRef = useRef(0);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
-  const sessionRef = useRef<any>(null);
-  const isStartingRef = useRef(false);
-  const hangupPendingRef = useRef(false);
-  const isActiveRef = useRef(false); // Track state without triggering re-renders for cleanup
+  const analyzerRef = useRef<AnalyserNode | null>(null);
 
-  // Summary Tracking
-  const callStartTimeRef = useRef<Date | null>(null);
-  const transcriptHistoryRef = useRef<{ role: 'user' | 'maya'; text: string }[]>([]);
-  const currentTurnRef = useRef<{ user?: string; maya?: string }>({});
-
-  const addLog = useCallback((message: string, type: 'tool' | 'info' | 'error' = 'info') => {
-    setLogs((prev) => [
-      { id: Math.random().toString(36).substr(2, 9), timestamp: new Date(), message, type },
-      ...prev.slice(0, 49)
-    ]);
-  }, []);
-
-  const logTechnicalEvent = async (event: string, metadata: any = {}) => {
-    // Only log if it's not a repetitive heartbeat to keep DB clean
-    if (event === 'Heartbeat') return; 
-    
-    console.debug(`[MAYA-DEBUG] ${event}`, metadata);
+  const persistLog = useCallback(async (message: string, type: 'tool' | 'info' | 'error', patientId?: string) => {
+    if (!isSupabaseConfigured()) return;
     try {
       await supabase.from('maya_debug_logs').insert([{
-        event,
-        metadata,
-        patient_phone: patient?.phone || 'unknown',
+        patient_id: patientId,
+        message,
+        type,
         timestamp: new Date().toISOString()
       }]);
-    } catch (e) {
-      console.warn('Silent failure on debug log:', e);
+    } catch (e) { console.error(e); }
+  }, []);
+
+  const addActionLog = useCallback((message: string, type: 'tool' | 'info' | 'error' = 'info') => {
+    const newLog: LogType = { id: Math.random().toString(36).substr(2, 9), timestamp: new Date(), message, type };
+    setActionLogs(prev => [newLog, ...prev.slice(0, 15)]);
+    persistLog(message, type, patient?.id);
+  }, [patient, persistLog]);
+
+  const fetchAppointments = useCallback(async (patientId: string) => {
+    const { data, error } = await supabase
+      .from('appointments')
+      .select('*')
+      .eq('patient_id', patientId)
+      .neq('status', 'cancelled')
+      .order('appointment_time', { ascending: true });
+    if (!error && data) setAppointments(data);
+  }, []);
+
+  const rescheduleAppointment = async (id: string, newTime: string) => {
+    const { data, error } = await supabase
+      .from('appointments')
+      .update({ appointment_time: newTime })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) {
+      addActionLog(`Reschedule failed: ${error.message}`, 'error');
+      return "Error updating appointment: " + error.message;
     }
+
+    setAppointments(prev => prev.map(a => a.id === id ? data : a));
+    addActionLog(`Rescheduled appointment ${id} to ${new Date(newTime).toLocaleString()}`, 'tool');
+    return "Appointment successfully moved to " + new Date(newTime).toLocaleString();
   };
 
-  const saveCallSummary = async (techIssue: boolean = false) => {
-    if (!callStartTimeRef.current || !patient) return;
+  const cancelAppointment = async (id: string) => {
+    const { error } = await supabase
+      .from('appointments')
+      .update({ status: 'cancelled' })
+      .eq('id', id);
 
-    const endTime = new Date();
-    const durationMs = endTime.getTime() - callStartTimeRef.current.getTime();
-    if (durationMs < 1500) return; 
-
-    const durationSeconds = Math.floor(durationMs / 1000);
-    const durationString = `${Math.floor(durationSeconds / 60)}m ${durationSeconds % 60}s`;
-    
-    const fullTranscript = transcriptHistoryRef.current
-      .map(entry => `${entry.role.toUpperCase()}: ${entry.text}`)
-      .join('\n');
-
-    let summaryText = techIssue ? "Technical error reported during session." : "Call ended abruptly or too short for summary.";
-
-    if (transcriptHistoryRef.current.length > 0) {
-      try {
-        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-        const response = await ai.models.generateContent({
-          model: 'gemini-3-flash-preview',
-          contents: `Provide a 1-sentence summary of this medical reception call based on this transcript: ${fullTranscript}`,
-          config: { systemInstruction: "Concise medical receptionist auditor." }
-        });
-        summaryText = response.text || "Summary generated.";
-      } catch (e) {
-        summaryText = "Transcript recorded, AI summary failed.";
-      }
+    if (error) {
+      addActionLog(`Cancellation failed: ${error.message}`, 'error');
+      return "Error cancelling: " + error.message;
     }
 
+    setAppointments(prev => prev.filter(a => a.id !== id));
+    addActionLog(`Cancelled appointment ${id}`, 'tool');
+    return "Appointment has been successfully cancelled.";
+  };
+
+  const bookAppointment = async (details: Partial<Appointment>) => {
+    if (!patient) return "Error: No patient identified";
+    const newAppointment = {
+      patient_id: patient.id,
+      department: details.department || 'General Medicine',
+      doctor_name: details.doctor_name || 'Dr. Smith',
+      appointment_time: details.appointment_time || new Date(Date.now() + 86400000).toISOString(),
+      reason: details.reason || 'Routine Checkup',
+      status: 'scheduled'
+    };
+
+    const { data, error } = await supabase.from('appointments').insert([newAppointment]).select().single();
+    if (error) return "Booking failed: " + error.message;
+
+    setAppointments(prev => [...prev, data].sort((a,b) => a.appointment_time.localeCompare(b.appointment_time)));
+    addActionLog(`Booked new appointment for ${data.department}`, 'tool');
+    return `Confirmed: ${data.department} at ${new Date(data.appointment_time).toLocaleString()}`;
+  };
+
+  const generateAndSaveSummary = async () => {
+    if (!patient || !sessionStartTime) return;
+    const transcript = actionLogs.filter(l => l.timestamp.getTime() > sessionStartTime).map(l => l.message).join('. ');
+    if (!transcript) return;
     try {
-      await supabase.from('user_call_summary').insert([{
-        user_number: patient.phone,
-        user_name: patient.name,
-        start_time: callStartTimeRef.current.toISOString(),
-        end_time: endTime.toISOString(),
-        duration: durationString,
-        call_summary: summaryText,
-        tech_issue_detected: techIssue
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: `Summarize this interaction (max 15 words): ${transcript}`
+      });
+      await supabase.from('user_chat_summaries').insert([{
+        patient_id: patient.id,
+        summary: response.text || "Routine session",
+        duration_seconds: Math.floor((Date.now() - sessionStartTime) / 1000),
+        timestamp: new Date().toISOString()
       }]);
-    } catch (dbErr) {
-      console.error('Summary DB error:', dbErr);
-    }
+    } catch (e) { console.error(e); }
   };
-
-  const stopAssistant = useCallback(async (techIssue: boolean = false) => {
-    // Check if we are actually active or starting
-    if (!isActiveRef.current && !isStartingRef.current) return;
-    
-    logTechnicalEvent('Session Shutdown', { techIssue });
-    saveCallSummary(techIssue);
-    
-    // 1. Stop active audio sources
-    sourcesRef.current.forEach(source => {
-      try { source.stop(); } catch (e) {}
-    });
-    sourcesRef.current.clear();
-
-    // 2. Disconnect ScriptProcessor
-    if (scriptProcessorRef.current) {
-      try {
-        scriptProcessorRef.current.disconnect();
-        scriptProcessorRef.current.onaudioprocess = null;
-      } catch (e) {}
-      scriptProcessorRef.current = null;
-    }
-
-    // 3. Release Microphone
-    if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach(track => track.stop());
-      mediaStreamRef.current = null;
-    }
-
-    // 4. Close Socket
-    if (sessionRef.current) {
-      try { await sessionRef.current.close(); } catch(e) {}
-      sessionRef.current = null;
-    }
-
-    // 5. Explicitly close Audio Contexts
-    try {
-      if (inputAudioContextRef.current && inputAudioContextRef.current.state !== 'closed') {
-        await inputAudioContextRef.current.close();
-      }
-      if (outputAudioContextRef.current && outputAudioContextRef.current.state !== 'closed') {
-        await outputAudioContextRef.current.close();
-      }
-    } catch (e) {}
-    
-    inputAudioContextRef.current = null;
-    outputAudioContextRef.current = null;
-
-    // 6. Reset State
-    isActiveRef.current = false;
-    setIsActive(false);
-    setBotState('idle');
-    isStartingRef.current = false;
-    hangupPendingRef.current = false;
-    callStartTimeRef.current = null;
-    nextStartTimeRef.current = 0;
-    transcriptHistoryRef.current = [];
-    currentTurnRef.current = {};
-    addLog('Maya disconnected.', techIssue ? 'error' : 'info');
-  }, [patient]); // Minimal dependencies
 
   useEffect(() => {
-    // Only cleanup on real unmount
-    return () => {
-      if (isActiveRef.current) stopAssistant();
+    if (patient) fetchAppointments(patient.id);
+  }, [patient, fetchAppointments]);
+
+  useEffect(() => {
+    let animationFrame: number;
+    const updateNoise = () => {
+      if (analyzerRef.current) {
+        const dataArray = new Uint8Array(analyzerRef.current.frequencyBinCount);
+        analyzerRef.current.getByteFrequencyData(dataArray);
+        setNoiseLevel(dataArray.reduce((a, b) => a + b) / dataArray.length);
+      }
+      animationFrame = requestAnimationFrame(updateNoise);
     };
-  }, []); // Run only once
+    updateNoise();
+    return () => cancelAnimationFrame(animationFrame);
+  }, []);
 
-  const toolHandlers = {
-    update_patient_name: async (args: { name: string }) => {
-      if (!patient) return "ERROR: No session.";
-      try {
-        await supabase.from('patients').update({ name: args.name }).eq('phone', patient.phone);
-        setPatient(prev => prev ? ({ ...prev, name: args.name }) : null);
-        return "SUCCESS: I will call you " + args.name + " from now on.";
-      } catch (err: any) { return `ERROR: ${err.message}`; }
-    },
-    get_doctors: async () => {
-      const { data, error } = await supabase.from('doctors').select('*');
-      return error ? `ERROR: ${error.message}` : data;
-    },
-    get_my_appointments: async () => {
-      const { data, error } = await supabase.from('doctor_appointments').select('id, appointment_time, status, doctors(name, specialty)').eq('patient_phone', patient?.phone).eq('status', 'scheduled');
-      return error ? `ERROR: ${error.message}` : data;
-    },
-    get_available_slots: async (args: any) => {
-      const days = Math.min(args.days_to_check || 1, 7);
-      const endDate = new Date(args.start_date);
-      endDate.setDate(endDate.getDate() + days);
-      const { data, error } = await supabase.from('doctor_slots').select('id, start_time').eq('doctor_id', args.doctor_id).eq('is_available', true).gte('start_time', `${args.start_date}T00:00:00Z`).lte('start_time', `${endDate.toISOString().split('T')[0]}T23:59:59Z`).order('start_time', { ascending: true }).limit(20);
-      return error ? `ERROR: ${error.message}` : data;
-    },
-    book_appointment: async (args: any) => {
-      try {
-        const { data: appt, error: apptErr } = await supabase.from('doctor_appointments').insert([{ patient_phone: patient?.phone, doctor_id: args.doctor_id, appointment_time: args.time_string, status: 'scheduled' }]).select().single();
-        if (apptErr) throw apptErr;
-        await supabase.from('doctor_slots').update({ is_available: false, booked_by_phone: patient?.phone, appointment_id: appt.id }).eq('id', args.slot_id);
-        return `SUCCESS: Booked.`;
-      } catch (err: any) { return `ERROR: ${err.message}`; }
-    },
-    get_opd_timings: async (args: any) => {
-      let query = supabase.from('opd_timings').select('*');
-      if (args.department) query = query.ilike('department', `%${args.department}%`);
-      const { data, error } = await query;
-      return error ? `ERROR: ${error.message}` : data;
-    },
-    hang_up: async () => {
-      hangupPendingRef.current = true;
-      logTechnicalEvent('Hang Up Protocol Triggered');
-      return "SUCCESS: Closing call.";
-    }
-  };
+  const stopMaya = useCallback(async () => {
+    setBotState('idle');
+    setIsMayaActive(false);
+    generateAndSaveSummary();
+    setSessionStartTime(null);
+    if (sessionRef.current) try { await sessionRef.current.close(); } catch(e) {}
+    sourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
+    sourcesRef.current.clear();
+    nextStartTimeRef.current = 0;
+    addActionLog('Maya session ended', 'info');
+  }, [addActionLog]);
 
-  const startAssistant = async () => {
-    if (!patient || isStartingRef.current) return;
-    
-    // Ensure clean slate
-    if (isActiveRef.current) await stopAssistant();
-    
-    isStartingRef.current = true;
-    setError(null);
-    setIsEmergency(false);
+  const startMaya = async () => {
+    if (isMayaActive) return;
+    setIsMayaActive(true);
+    setBotState('initiating');
+    setSessionStartTime(Date.now());
     
     try {
-      setIsActive(true);
-      isActiveRef.current = true;
-      setBotState('processing');
-      logTechnicalEvent('Connection Initialized');
-
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-      
-      const inCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-      const outCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-      
-      await inCtx.resume();
-      await outCtx.resume();
-      
+      const inCtx = new AudioContext({ sampleRate: 16000 });
+      const outCtx = new AudioContext({ sampleRate: 24000 });
       inputAudioContextRef.current = inCtx;
       outputAudioContextRef.current = outCtx;
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      mediaStreamRef.current = stream;
       
       const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         callbacks: {
           onopen: () => {
-            callStartTimeRef.current = new Date();
             setBotState('listening');
-            logTechnicalEvent('Socket Open Success');
-            
             const source = inCtx.createMediaStreamSource(stream);
+            const analyzer = inCtx.createAnalyser();
+            analyzer.fftSize = 256;
+            source.connect(analyzer);
+            analyzerRef.current = analyzer;
+
             const scriptProcessor = inCtx.createScriptProcessor(4096, 1, 1);
-            scriptProcessorRef.current = scriptProcessor;
-            
             scriptProcessor.onaudioprocess = (e) => {
-              if (!isActiveRef.current) return;
               const inputData = e.inputBuffer.getChannelData(0);
               const int16 = new Int16Array(inputData.length);
-              for (let i = 0; i < inputData.length; i++) {
-                int16[i] = inputData[i] * 32768;
-              }
-              const pcmBlob = { data: encode(new Uint8Array(int16.buffer)), mimeType: 'audio/pcm;rate=16000' };
-              sessionPromise.then(s => s.sendRealtimeInput({ media: pcmBlob }));
+              for (let i = 0; i < inputData.length; i++) int16[i] = inputData[i] * 32768;
+              sessionPromise.then(s => s.sendRealtimeInput({ media: { data: encode(new Uint8Array(int16.buffer)), mimeType: 'audio/pcm;rate=16000' } }));
             };
-
             source.connect(scriptProcessor);
             scriptProcessor.connect(inCtx.destination);
           },
-          onmessage: async (message: LiveServerMessage) => {
-            if (message.serverContent?.outputTranscription) {
-              const text = message.serverContent.outputTranscription.text;
-              currentTurnRef.current.maya = (currentTurnRef.current.maya || '') + text;
-              if (text.toLowerCase().includes('emergency')) setIsEmergency(true);
-            } else if (message.serverContent?.inputTranscription) {
-              currentTurnRef.current.user = (currentTurnRef.current.user || '') + message.serverContent.inputTranscription.text;
-            }
-
-            if (message.serverContent?.turnComplete) {
-              if (currentTurnRef.current.user) transcriptHistoryRef.current.push({ role: 'user', text: currentTurnRef.current.user });
-              if (currentTurnRef.current.maya) transcriptHistoryRef.current.push({ role: 'maya', text: currentTurnRef.current.maya });
-              currentTurnRef.current = {};
-            }
-
-            const modelParts = message.serverContent?.modelTurn?.parts;
-            if (modelParts?.[0]?.inlineData?.data && outputAudioContextRef.current) {
+          onmessage: async (msg: LiveServerMessage) => {
+            const base64Audio = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+            if (base64Audio) {
               setBotState('speaking');
-              const ctx = outputAudioContextRef.current;
-              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
-              
-              const buffer = await decodeAudioData(decode(modelParts[0].inlineData.data), ctx, 24000, 1);
-              const source = ctx.createBufferSource();
+              const buffer = await decodeAudioData(decode(base64Audio), outCtx, 24000, 1);
+              const source = outCtx.createBufferSource();
               source.buffer = buffer;
-              source.connect(ctx.destination);
-              
+              source.connect(outCtx.destination);
               source.onended = () => {
                 sourcesRef.current.delete(source);
-                if (sourcesRef.current.size === 0) {
-                  setBotState('listening');
-                  if (hangupPendingRef.current) stopAssistant();
-                }
+                if (sourcesRef.current.size === 0) setBotState('listening');
               };
-
-              source.start(nextStartTimeRef.current);
-              nextStartTimeRef.current += buffer.duration;
+              const startTime = Math.max(nextStartTimeRef.current, outCtx.currentTime);
+              source.start(startTime);
+              nextStartTimeRef.current = startTime + buffer.duration;
               sourcesRef.current.add(source);
             }
 
-            if (message.toolCall?.functionCalls) {
-              for (const fc of message.toolCall.functionCalls) {
-                const result = await (toolHandlers as any)[fc.name]?.(fc.args);
-                sessionPromise.then(s => s.sendToolResponse({ 
-                  functionResponses: { id: fc.id, name: fc.name, response: { result } } 
-                }));
+            if (msg.toolCall?.functionCalls) {
+              for (const fc of msg.toolCall.functionCalls) {
+                let result: any = "OK";
+                if (fc.name === 'book_appointment') result = await bookAppointment(fc.args);
+                else if (fc.name === 'reschedule_appointment') result = await rescheduleAppointment(fc.args.appointment_id, fc.args.new_appointment_time);
+                else if (fc.name === 'cancel_appointment') result = await cancelAppointment(fc.args.appointment_id);
+                else if (fc.name === 'hang_up') stopMaya();
+                else if (fc.name === 'get_patient_appointments') result = appointments.map(a => `[ID: ${a.id}] ${a.department} w/ ${a.doctor_name} on ${new Date(a.appointment_time).toLocaleString()}`).join('\n');
+                
+                sessionPromise.then(s => s.sendToolResponse({ functionResponses: { id: fc.id, name: fc.name, response: { result } } }));
               }
             }
           },
-          onerror: (e) => {
-            logTechnicalEvent('Socket Error Event', { msg: e.message });
-            setError('Maya is experiencing a delay. Please try connecting again.');
-            stopAssistant(true);
-          },
-          onclose: (e) => {
-            logTechnicalEvent('Socket Closed Event', { code: e.code, reason: e.reason });
-            if (isActiveRef.current) stopAssistant();
-          }
+          onerror: (e) => { console.error(e); stopMaya(); },
+          onclose: () => stopMaya()
         },
         config: {
           responseModalities: [Modality.AUDIO],
-          systemInstruction: SYSTEM_INSTRUCTION + `\n\nPatient Name: ${patient.name}\nPhone: ${patient.phone}`,
-          tools: [{ functionDeclarations: TOOLS }],
-          outputAudioTranscription: {},
-          inputAudioTranscription: {},
-          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } } }
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } },
+          systemInstruction: SYSTEM_INSTRUCTION + `\n\nPatient: ${patient?.name}\nAppointments: ${JSON.stringify(appointments)}`,
+          tools: [{ functionDeclarations: TOOLS }]
         }
       });
       sessionRef.current = await sessionPromise;
-      isStartingRef.current = false;
-    } catch (err: any) {
-      logTechnicalEvent('Start Failure', { error: err.message });
-      setError(`Could not wake Maya: ${err.message}`);
-      stopAssistant(true);
-    }
+    } catch (e: any) { stopMaya(); }
   };
 
-  return (
-    <div className={`min-h-screen flex flex-col transition-colors duration-1000 ${isEmergency ? 'bg-red-50' : 'bg-slate-50'}`}>
-      <nav className="bg-white border-b border-slate-200 px-8 py-4 flex items-center justify-between sticky top-0 z-50">
-        <div className="flex items-center space-x-3">
-          <div className={`${isEmergency ? 'bg-red-600' : 'bg-indigo-600'} p-2 rounded-xl`}>
-            <Activity className="w-5 h-5 text-white" />
-          </div>
-          <div>
-            <h1 className="font-black text-lg text-slate-900 leading-none">Maya AI</h1>
-            <p className="text-[10px] text-indigo-600 font-black uppercase tracking-widest mt-1">HSR Sector 7</p>
-          </div>
-        </div>
-        {patient && (
-          <div className="flex items-center space-x-4">
-            <div className="flex flex-col items-end">
-              <span className="text-[10px] font-black text-slate-400 uppercase">Hospital ID Sync</span>
-              <span className="text-sm font-bold text-slate-900">{patient.name}</span>
-            </div>
-            <button onClick={() => { stopAssistant(); setPatient(null); }} className="p-2 hover:bg-rose-50 rounded-lg group transition-colors">
-              <LogOut className="w-5 h-5 text-slate-400 group-hover:text-rose-500" />
-            </button>
-          </div>
-        )}
-      </nav>
+  if (!patient) return <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6"><PatientSetup onComplete={setPatient} /></div>;
 
-      <main className="flex-1 flex overflow-hidden">
-        <div className="flex-1 flex flex-col relative overflow-y-auto">
-          {!patient ? (
-            <div className="flex-1 flex items-center justify-center p-8">
-              <PatientSetup onComplete={setPatient} />
+  return (
+    <div className="min-h-screen bg-white flex flex-col md:flex-row overflow-hidden">
+      <div className="flex-1 flex flex-col overflow-y-auto">
+        {!isSupabaseConfigured() && <div className="bg-amber-500 text-white px-6 py-2 flex items-center justify-center space-x-2 text-xs font-black uppercase tracking-widest z-50"><WifiOff className="w-4 h-4" /><span>Database Keys Missing</span></div>}
+
+        <header className="px-8 py-6 border-b border-slate-100 flex items-center justify-between sticky top-0 bg-white/80 backdrop-blur-md z-30">
+          <div className="flex items-center space-x-4">
+            <div className="bg-indigo-600 p-3 rounded-2xl shadow-lg"><HeartPulse className="w-6 h-6 text-white" /></div>
+            <div><h1 className="text-xl font-black text-slate-900 leading-none">Nurse Maya</h1><p className="text-xs font-bold text-slate-400 mt-1 uppercase">City Reception</p></div>
+          </div>
+          <button onClick={() => setPatient(null)} className="p-3 rounded-2xl bg-slate-50 text-slate-400 hover:text-red-500 transition-all"><LogOut className="w-5 h-5" /></button>
+        </header>
+
+        <div className="p-8 max-w-5xl mx-auto w-full space-y-12">
+          <section className="grid grid-cols-1 sm:grid-cols-3 gap-6">
+            <div className="bg-slate-50 p-6 rounded-[2rem] flex items-center space-x-4 border border-slate-100">
+              <div className="bg-white p-3 rounded-2xl text-indigo-600 shadow-sm"><Calendar className="w-6 h-6" /></div>
+              <div><p className="text-[10px] font-black text-slate-400 uppercase">Active Bookings</p><p className="text-2xl font-black text-slate-900">{appointments.length}</p></div>
+            </div>
+          </section>
+
+          <section className="space-y-6">
+            <h2 className="text-lg font-black text-slate-900 px-2">Scheduled Visits</h2>
+            <div className="space-y-4">
+              {appointments.length === 0 ? <div className="bg-slate-50 border-2 border-dashed border-slate-200 rounded-[2.5rem] p-12 text-center text-slate-400 font-bold">No upcoming appointments.</div> : 
+                appointments.map(app => (
+                  <div key={app.id} className="bg-white border border-slate-100 p-6 rounded-[2rem] flex items-center justify-between group hover:border-indigo-200 hover:shadow-xl transition-all">
+                    <div className="flex items-center space-x-6">
+                      <div className="w-16 h-16 rounded-[1.5rem] bg-indigo-50 flex items-center justify-center text-indigo-600"><User className="w-8 h-8" /></div>
+                      <div>
+                        <h4 className="font-black text-slate-900 text-lg">{app.doctor_name}</h4>
+                        <p className="text-xs text-slate-400 uppercase font-black">{app.department} • {new Date(app.appointment_time).toLocaleString()}</p>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+            </div>
+          </section>
+        </div>
+      </div>
+
+      <aside className="w-full md:w-[400px] border-l border-slate-100 bg-white flex flex-col">
+        <div className="p-8 flex-1 flex flex-col items-center justify-center space-y-12">
+          <div className="w-full px-4 space-y-2">
+            <div className="flex items-center justify-between text-[10px] font-black uppercase text-slate-400"><span><Volume2 className="w-3 h-3 inline mr-1" /> Mic Noise</span><span className={noiseLevel > 60 ? 'text-rose-500' : 'text-emerald-500'}>{noiseLevel > 60 ? 'High' : 'Normal'}</span></div>
+            <div className="w-full h-1 bg-slate-100 rounded-full overflow-hidden"><div className={`h-full transition-all duration-300 ${noiseLevel > 60 ? 'bg-rose-500' : 'bg-indigo-500'}`} style={{ width: `${Math.min(noiseLevel, 100)}%` }} /></div>
+          </div>
+
+          {!isMayaActive ? (
+            <div className="text-center space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-700">
+              <div className="w-48 h-48 rounded-[3.5rem] bg-slate-50 flex items-center justify-center border-2 border-dashed border-slate-200 mx-auto"><Mic className="w-16 h-16 text-slate-300" /></div>
+              <h3 className="text-2xl font-black text-slate-900">Nurse Maya AI</h3>
+              <button onClick={startMaya} className="w-full bg-slate-900 hover:bg-indigo-600 text-white font-black py-5 rounded-[2rem] transition-all flex items-center justify-center space-x-3"><Mic className="w-5 h-5" /><span>Start Session</span></button>
             </div>
           ) : (
-            <div className="flex-1 flex flex-col items-center justify-center p-8 text-center max-w-4xl mx-auto w-full">
-              {!isActive ? (
-                <div className="w-full space-y-12 animate-in fade-in slide-in-from-bottom-4 duration-500">
-                  <div className="space-y-4">
-                    <h2 className="text-4xl font-black text-slate-900">Welcome, <span className="text-indigo-600">{patient.name}</span>.</h2>
-                    <p className="text-slate-500 font-medium">How can our team help you today?</p>
-                  </div>
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                    <div className="bg-white p-8 rounded-[2.5rem] border border-slate-100 shadow-sm text-left group hover:border-indigo-200 transition-all cursor-pointer">
-                      <Calendar className="w-8 h-8 text-blue-500 mb-4" />
-                      <h3 className="font-bold text-slate-800">Booking</h3>
-                      <p className="text-xs text-slate-500 mt-2">Manage appointments with ease.</p>
-                    </div>
-                    <div className="bg-white p-8 rounded-[2.5rem] border border-slate-100 shadow-sm text-left group hover:border-emerald-200 transition-all cursor-pointer">
-                      <Search className="w-8 h-8 text-emerald-500 mb-4" />
-                      <h3 className="font-bold text-slate-800">Timings</h3>
-                      <p className="text-xs text-slate-500 mt-2">Check OPD schedules.</p>
-                    </div>
-                    <div className="bg-white p-8 rounded-[2.5rem] border border-slate-100 shadow-sm text-left group hover:border-orange-200 transition-all cursor-pointer">
-                      <MapPin className="w-8 h-8 text-orange-500 mb-4" />
-                      <h3 className="font-bold text-slate-800">Locate</h3>
-                      <p className="text-xs text-slate-500 mt-2">Find wards and labs.</p>
-                    </div>
-                  </div>
-                  <button onClick={startAssistant} className="inline-flex items-center justify-center px-12 py-6 font-black text-xl text-white bg-slate-900 rounded-[2rem] hover:bg-indigo-600 transition-all shadow-2xl shadow-indigo-100/50 hover:scale-[1.02] active:scale-[0.98]">
-                    <Mic className="w-6 h-6 mr-3" />
-                    Connect to Maya
-                  </button>
-                </div>
-              ) : (
-                <div className="flex flex-col items-center justify-center h-full space-y-12 w-full">
-                  <PulseOrb state={botState} isEmergency={isEmergency} />
-                  <div className="w-full max-w-lg space-y-8">
-                    <div className="bg-white px-8 py-6 rounded-[2.5rem] border border-slate-200 shadow-2xl flex items-center space-x-6">
-                      <div className={`w-3 h-3 rounded-full animate-pulse ${isEmergency ? 'bg-red-600' : 'bg-indigo-500'}`} />
-                      <p className="text-lg text-slate-800 font-bold">
-                        {botState === 'listening' ? "Maya is listening..." : botState === 'speaking' ? "Maya is responding..." : "Working..."}
-                      </p>
-                    </div>
-                    {error && <p className="text-rose-600 font-bold text-sm bg-rose-50 p-4 rounded-2xl border border-rose-100 animate-in slide-in-from-top-2">{error}</p>}
-                    <button onClick={() => stopAssistant()} className="bg-slate-100 text-slate-600 px-10 py-5 rounded-full font-black text-sm hover:bg-rose-50 hover:text-rose-600 transition-all shadow-sm">
-                      End Call
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
+            <div className="flex flex-col items-center w-full animate-in zoom-in duration-500"><PulseOrb state={botState} /><button onClick={stopMaya} className="mt-12 text-rose-500 font-black text-xs uppercase hover:bg-rose-50 px-6 py-2 rounded-full transition-all">End Session</button></div>
           )}
         </div>
-        <aside className="hidden lg:block w-[340px] bg-white border-l border-slate-200">
-          <ActionLog logs={logs} />
-        </aside>
-      </main>
+        <div className="h-[300px] border-t border-slate-100"><ActionLog logs={actionLogs} /></div>
+      </aside>
     </div>
   );
 };
