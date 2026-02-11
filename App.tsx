@@ -62,7 +62,6 @@ const App: React.FC = () => {
   const [botState, setBotState] = useState<BotState>('idle');
   const [actionLogs, setActionLogs] = useState<LogType[]>([]);
   const [isMayaActive, setIsMayaActive] = useState(false);
-  const [sessionStartTime, setSessionStartTime] = useState<number | null>(null);
 
   const inputAudioContextRef = useRef<AudioContext | null>(null);
   const outputAudioContextRef = useRef<AudioContext | null>(null);
@@ -70,6 +69,7 @@ const App: React.FC = () => {
   const nextStartTimeRef = useRef(0);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const transcriptRef = useRef<string[]>([]);
+  const sessionStartTimeRef = useRef<number | null>(null);
 
   // Session Persistence
   useEffect(() => {
@@ -150,11 +150,14 @@ const App: React.FC = () => {
   }, [patient, fetchData]);
 
   const stopMaya = useCallback(async () => {
+    // Check if a session was actually running
+    if (!sessionStartTimeRef.current) return;
+
     setBotState('idle');
     setIsMayaActive(false);
     
     const finalTranscript = transcriptRef.current.join(' ');
-    const startTime = sessionStartTime;
+    const startTime = sessionStartTimeRef.current;
     const endTime = Date.now();
     const phone = patient?.phone;
     const name = patient?.name;
@@ -169,7 +172,7 @@ const App: React.FC = () => {
         const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
         const prompt = finalTranscript.length > 20 
           ? `Summarize this medical receptionist conversation briefly (max 20 words): ${finalTranscript}`
-          : `Provide a very short status for this session: ${actionLogs.filter(l => l.timestamp.getTime() > startTime).map(l => l.message).join('. ')}`;
+          : `Provide a very short status for this session: Conversation ended quickly.`;
 
         const response = await ai.models.generateContent({
           model: 'gemini-3-flash-preview',
@@ -185,13 +188,13 @@ const App: React.FC = () => {
           duration: durationStr,
           start_time: new Date(startTime).toISOString(),
           end_time: new Date(endTime).toISOString(),
-          tech_issue_detected: false
+          tech_issue_detected: false // Explicitly set as per schema
         };
 
         const { data, error } = await supabase.from('user_call_summary').insert([newSummary]).select().single();
         if (error) {
           addActionLog(`Summary DB Error: ${error.message}`, 'error');
-          logToDebug('SUMMARY_SAVE_ERROR', { error: error.message, data: newSummary });
+          logToDebug('SUMMARY_SAVE_ERROR', { error_code: error.code, error_message: error.message, data: newSummary });
         } else if (data) {
           setSummaries(prev => [data, ...prev]);
           logToDebug('SUMMARY_SAVED', { summary_id: data.call_id });
@@ -202,7 +205,7 @@ const App: React.FC = () => {
       }
     }
 
-    setSessionStartTime(null);
+    sessionStartTimeRef.current = null;
     transcriptRef.current = [];
     if (sessionRef.current) try { await sessionRef.current.close(); } catch(e) {}
     sourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
@@ -210,7 +213,7 @@ const App: React.FC = () => {
     nextStartTimeRef.current = 0;
     addActionLog('Maya session concluded', 'info');
     logToDebug('SESSION_ENDED', { duration_seconds: startTime ? Math.floor((Date.now() - startTime) / 1000) : 0 });
-  }, [patient, sessionStartTime, actionLogs, addActionLog, logToDebug]);
+  }, [patient, addActionLog, logToDebug]);
 
   const startMaya = async () => {
     if (isMayaActive || !patient) return;
@@ -219,7 +222,7 @@ const App: React.FC = () => {
 
     setIsMayaActive(true);
     setBotState('initiating');
-    setSessionStartTime(Date.now());
+    sessionStartTimeRef.current = Date.now();
     transcriptRef.current = [];
     logToDebug('SESSION_STARTED');
     
@@ -376,7 +379,6 @@ const App: React.FC = () => {
                   } else result = "Could not find the original appointment.";
                 }
                 else if (fc.name === 'hang_up') {
-                  // Wait briefly for the "Thank you" audio to finish before ending session
                   addActionLog('Maya is concluding the call...', 'info');
                   setTimeout(() => {
                     stopMaya();

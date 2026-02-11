@@ -160,11 +160,11 @@ const PatientSetup: React.FC<PatientSetupProps> = ({ onComplete }) => {
               </div>
               <ul className="space-y-5">
                 {[
-                  "Emergency Ambulance Dispatch",
-                  "Insurance Policy Consulting",
-                  "Formal Medical Diagnosis",
-                  "Laboratory Result Analysis",
-                  "Prescription Management"
+                  "No OTP authentication for login",
+                  "No OTP verification to cancel or reschedule appointments",
+                  "No payment or refund flow",
+                  "No Emergency Ambulance Dispatch",
+                  "No Insurance Consulting"
                 ].map((item, i) => (
                   <li key={i} className="flex items-start text-sm text-slate-500 font-medium opacity-80">
                     <div className="w-1.5 h-1.5 rounded-full bg-slate-300 mt-2 mr-3 shrink-0" />

@@ -40,6 +40,7 @@ export interface ChatSummary {
   duration: string;
   start_time: string;
   end_time: string;
+  tech_issue_detected: boolean;
   created_at: string;
 }
 
