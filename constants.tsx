@@ -9,21 +9,30 @@ export const SYSTEM_INSTRUCTION = `
 - You have access to three main databases: Doctors, Lab Tests, and OPD Timings.
 
 ## 2. CAPABILITIES & TOOLS
-- **Doctor Discovery:** Use 'get_doctors' to find specialists (Cardiology, Orthopedics, etc.).
-- **Lab Discovery:** Use 'get_labs' to list available tests (Blood Work, MRI, etc.) and prices.
-- **OPD Info:** Use 'get_opd_timings' to find room numbers and schedules for specific departments.
+- **Doctor Discovery:** Use 'get_doctors' to find specialists.
+- **Lab Discovery:** Use 'get_labs' to list available tests and prices.
+- **OPD Info:** Use 'get_opd_timings' to find room numbers and schedules.
 - **Appointments:** 
     - Use 'get_patient_appointments' to check existing ones.
     - Use 'book_doctor_appointment' for new doctor visits.
     - Use 'book_lab_appointment' for lab tests.
-    - Use 'cancel_appointment' to remove a booking.
+    - Use 'cancel_doctor_appointment' to remove a doctor booking.
+    - Use 'cancel_lab_appointment' to remove a lab booking.
+    - Use 'reschedule_doctor_appointment' to change a doctor visit.
+    - Use 'reschedule_lab_appointment' to change a lab test.
 
-## 3. GUIDELINES
-- Be warm and efficient.
-- **IMPORTANT:** All times and dates mentioned must be in Indian Standard Time (IST).
+## 3. CALL CONCLUSION PROTOCOL (CRITICAL)
+- **Completion Check:** If you feel all requests are completed (e.g., after booking/rescheduling or if the user seems done), ALWAYS ask: "Is there anything else I can help you with today?"
+- **User Confirms Done:** If the user says "No", "That's all", or "Cancel" (meaning they want to end the call), you MUST:
+    1. Say exactly: "Thank you for calling City General Hospital. You can call anytime you need help in the future. Have a great day!"
+    2. Immediately after speaking, call the 'hang_up' tool.
+- **Cancellation Flow:** If a user cancels an appointment, follow the same "Is there anything else?" logic before concluding.
+
+## 4. GUIDELINES
+- Be warm, professional, and efficient.
+- **IMPORTANT:** All times and dates must be in Indian Standard Time (IST).
 - Always verify the doctor's name or test name before booking.
-- If a patient asks for a "Checkup", suggest a General Medicine doctor.
-- Use 'hang_up' when the user is done.
+- Use 'hang_up' ONLY when the user is finished.
 `;
 
 export const TOOLS: FunctionDeclaration[] = [
@@ -72,7 +81,7 @@ export const TOOLS: FunctionDeclaration[] = [
     parameters: { type: Type.OBJECT, properties: {} }
   },
   {
-    name: 'cancel_appointment',
+    name: 'cancel_doctor_appointment',
     description: 'Cancels an existing doctor appointment.',
     parameters: {
       type: Type.OBJECT,
@@ -80,6 +89,41 @@ export const TOOLS: FunctionDeclaration[] = [
         appointment_id: { type: Type.STRING }
       },
       required: ['appointment_id']
+    }
+  },
+  {
+    name: 'cancel_lab_appointment',
+    description: 'Cancels an existing lab appointment.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        appointment_id: { type: Type.STRING }
+      },
+      required: ['appointment_id']
+    }
+  },
+  {
+    name: 'reschedule_doctor_appointment',
+    description: 'Changes the time of an existing doctor appointment.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        appointment_id: { type: Type.STRING },
+        new_time: { type: Type.STRING, description: 'ISO string date' }
+      },
+      required: ['appointment_id', 'new_time']
+    }
+  },
+  {
+    name: 'reschedule_lab_appointment',
+    description: 'Changes the time of an existing lab appointment.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        appointment_id: { type: Type.STRING },
+        new_time: { type: Type.STRING, description: 'ISO string date' }
+      },
+      required: ['appointment_id', 'new_time']
     }
   },
   {

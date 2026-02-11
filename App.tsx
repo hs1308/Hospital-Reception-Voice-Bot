@@ -327,14 +327,60 @@ const App: React.FC = () => {
                   result = appointments.length > 0 ? appointments : "No appointments found.";
                   addActionLog('Maya fetched live history', 'tool');
                 }
-                else if (fc.name === 'cancel_appointment') {
+                else if (fc.name === 'cancel_doctor_appointment') {
                   await supabase.from('doctor_appointments').update({ status: 'cancelled' }).eq('id', fc.args.appointment_id);
                   setAppointments(prev => prev.map(a => a.id === fc.args.appointment_id ? { ...a, status: 'cancelled' } : a));
-                  result = "Cancelled.";
-                  addActionLog('Maya cancelled visit', 'tool');
+                  result = "Doctor appointment cancelled.";
+                  addActionLog('Maya cancelled doctor visit', 'tool');
+                }
+                else if (fc.name === 'cancel_lab_appointment') {
+                  await supabase.from('lab_appointments').update({ status: 'cancelled' }).eq('id', fc.args.appointment_id);
+                  setAppointments(prev => prev.map(a => a.id === fc.args.appointment_id ? { ...a, status: 'cancelled' } : a));
+                  result = "Lab appointment cancelled.";
+                  addActionLog('Maya cancelled lab test', 'tool');
+                }
+                else if (fc.name === 'reschedule_doctor_appointment') {
+                  const { data: oldAppt } = await supabase.from('doctor_appointments').select('*').eq('id', fc.args.appointment_id).single();
+                  if (oldAppt) {
+                    await supabase.from('doctor_appointments').update({ status: 'cancelled' }).eq('id', fc.args.appointment_id);
+                    const newAppt = {
+                      patient_phone: patient.phone,
+                      doctor_id: oldAppt.doctor_id,
+                      appointment_time: fc.args.new_time,
+                      status: 'scheduled'
+                    };
+                    const { data, error } = await supabase.from('doctor_appointments').insert([newAppt]).select('*, doctors(*)').single();
+                    if (data) {
+                      setAppointments(prev => [data as any, ...prev.filter(a => a.id !== fc.args.appointment_id)]);
+                      result = `Success: Doctor appointment rescheduled to ${formatFriendlyIST(data.appointment_time)}`;
+                      addActionLog(`Maya rescheduled doctor visit`, 'tool');
+                    } else result = `Error: ${error?.message}`;
+                  } else result = "Could not find the original appointment.";
+                }
+                else if (fc.name === 'reschedule_lab_appointment') {
+                  const { data: oldAppt } = await supabase.from('lab_appointments').select('*').eq('id', fc.args.appointment_id).single();
+                  if (oldAppt) {
+                    await supabase.from('lab_appointments').update({ status: 'cancelled' }).eq('id', fc.args.appointment_id);
+                    const newAppt = {
+                      patient_phone: patient.phone,
+                      lab_id: oldAppt.lab_id,
+                      appointment_time: fc.args.new_time,
+                      status: 'scheduled'
+                    };
+                    const { data, error } = await supabase.from('lab_appointments').insert([newAppt]).select('*, labs(*)').single();
+                    if (data) {
+                      setAppointments(prev => [data as any, ...prev.filter(a => a.id !== fc.args.appointment_id)]);
+                      result = `Success: Lab test rescheduled to ${formatFriendlyIST(data.appointment_time)}`;
+                      addActionLog(`Maya rescheduled lab test`, 'tool');
+                    } else result = `Error: ${error?.message}`;
+                  } else result = "Could not find the original appointment.";
                 }
                 else if (fc.name === 'hang_up') {
-                  stopMaya();
+                  // Wait briefly for the "Thank you" audio to finish before ending session
+                  addActionLog('Maya is concluding the call...', 'info');
+                  setTimeout(() => {
+                    stopMaya();
+                  }, 3500);
                 }
                 
                 sessionPromise.then(s => s.sendToolResponse({ functionResponses: { id: fc.id, name: fc.name, response: { result } } }));
@@ -455,7 +501,7 @@ const App: React.FC = () => {
                         </div>
                         <div className="min-w-0">
                           <h4 className="font-bold text-slate-900 text-[15px] truncate leading-tight">
-                            {app.doctors?.name || app.labs?.test_name || 'Medical Visit'}
+                            {app.doctors ? `${app.doctors.name}, ${app.doctors.specialty}` : (app.labs?.test_name || 'Medical Visit')}
                           </h4>
                           <p className="text-[11px] font-black text-indigo-600 uppercase tracking-tight mt-1">
                             {formatFriendlyIST(app.appointment_time)}
@@ -484,7 +530,9 @@ const App: React.FC = () => {
                           {app.status === 'cancelled' ? <AlertCircle className="w-6 h-6" /> : <CheckCircle2 className="w-6 h-6" />}
                         </div>
                         <div className="min-w-0">
-                          <h4 className="font-bold text-slate-600 text-[15px] truncate leading-tight">{app.doctors?.name || app.labs?.test_name}</h4>
+                          <h4 className="font-bold text-slate-600 text-[15px] truncate leading-tight">
+                            {app.doctors ? `${app.doctors.name}, ${app.doctors.specialty}` : (app.labs?.test_name || 'Medical Visit')}
+                          </h4>
                           <p className="text-[11px] font-black text-slate-400 uppercase tracking-tighter mt-1">
                             {app.status.toUpperCase()} • {formatFriendlyIST(app.appointment_time)}
                           </p>
