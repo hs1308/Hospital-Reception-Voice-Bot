@@ -9,11 +9,11 @@ import PulseOrb from './components/PulseOrb';
 import ActionLog from './components/ActionLog';
 import { 
   Calendar, Clock, User, 
-  Stethoscope, LogOut, 
-  Mic, HeartPulse, ShieldCheck,
+  LogOut, 
+  Mic, HeartPulse, 
   ChevronRight, AlertCircle, CheckCircle2,
-  Activity, WifiOff, Volume2, MessageSquare,
-  History, Timer, FlaskConical, MapPin
+  Activity, WifiOff, MessageSquare,
+  History, Timer, FlaskConical
 } from 'lucide-react';
 
 function encode(bytes: Uint8Array) {
@@ -41,6 +41,24 @@ async function decodeAudioData(data: Uint8Array, ctx: AudioContext, sampleRate: 
   return buffer;
 }
 
+// Unified IST Formatter
+const formatIST = (dateStr: string | undefined, includeTime: boolean = false) => {
+  if (!dateStr) return 'N/A';
+  const date = new Date(dateStr);
+  const options: Intl.DateTimeFormatOptions = {
+    timeZone: 'Asia/Kolkata',
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+  };
+  if (includeTime) {
+    options.hour = '2-digit';
+    options.minute = '2-digit';
+    options.hour12 = true;
+  }
+  return new Intl.DateTimeFormat('en-GB', options).format(date);
+};
+
 const App: React.FC = () => {
   const [patient, setPatient] = useState<Patient | null>(null);
   const [appointments, setAppointments] = useState<Appointment[]>([]);
@@ -55,23 +73,36 @@ const App: React.FC = () => {
   const sessionRef = useRef<any>(null);
   const nextStartTimeRef = useRef(0);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  const transcriptRef = useRef<string[]>([]);
 
   const addActionLog = useCallback((message: string, type: 'tool' | 'info' | 'error' = 'info') => {
     const newLog: LogType = { id: Math.random().toString(36).substr(2, 9), timestamp: new Date(), message, type };
     setActionLogs(prev => [newLog, ...prev.slice(0, 20)]);
   }, []);
 
+  const logToDebug = useCallback(async (event: string, metadata: any = {}) => {
+    if (!isSupabaseConfigured() || !patient) return;
+    try {
+      await supabase.from('maya_debug_logs').insert([{
+        patient_phone: patient.phone,
+        event,
+        metadata,
+        timestamp: new Date().toISOString()
+      }]);
+    } catch (e) {
+      console.warn('Debug logging failed', e);
+    }
+  }, [patient]);
+
   const fetchData = useCallback(async (phone: string) => {
     if (!isSupabaseConfigured()) return;
     
-    // Fetch Doctor Appointments joined with Doctors
     const { data: drData, error: drError } = await supabase
       .from('doctor_appointments')
       .select('*, doctors(*)')
       .eq('patient_phone', phone)
       .order('appointment_time', { ascending: false });
     
-    // Fetch Lab Appointments joined with Labs
     const { data: labData } = await supabase
       .from('lab_appointments')
       .select('*, labs(*)')
@@ -87,7 +118,6 @@ const App: React.FC = () => {
 
     setAppointments(combined as any);
 
-    // Fetch Summaries from user_call_summary
     const { data: summaryData } = await supabase
       .from('user_call_summary')
       .select('*')
@@ -105,37 +135,64 @@ const App: React.FC = () => {
     setBotState('idle');
     setIsMayaActive(false);
     
-    if (patient && sessionStartTime) {
-      const transcript = actionLogs.filter(l => l.timestamp.getTime() > sessionStartTime).map(l => l.message).join('. ');
-      if (transcript) {
-        try {
-          const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-          const response = await ai.models.generateContent({
-            model: 'gemini-3-flash-preview',
-            contents: `Summarize this interaction (max 15 words): ${transcript}`
-          });
-          const duration = Math.floor((Date.now() - sessionStartTime) / 1000);
-          const newSummary = {
-            user_number: patient.phone,
-            user_name: patient.name,
-            call_summary: response.text || "Routine medical session",
-            duration: `${duration} seconds`,
-            start_time: new Date(sessionStartTime).toISOString(),
-            end_time: new Date().toISOString()
-          };
-          const { data } = await supabase.from('user_call_summary').insert([newSummary]).select().single();
-          if (data) setSummaries(prev => [data, ...prev]);
-        } catch (e) { console.error('Summary persist failed:', e); }
+    const finalTranscript = transcriptRef.current.join(' ');
+    const startTime = sessionStartTime;
+    const endTime = Date.now();
+    const phone = patient?.phone;
+    const name = patient?.name;
+
+    if (phone && startTime) {
+      const durationVal = Math.floor((endTime - startTime) / 1000);
+      const durationStr = durationVal > 60 
+        ? `${Math.floor(durationVal / 60)}m ${durationVal % 60}s` 
+        : `0m ${durationVal}s`;
+
+      try {
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+        const prompt = finalTranscript.length > 20 
+          ? `Summarize this medical receptionist conversation briefly (max 20 words): ${finalTranscript}`
+          : `Provide a very short status for this session: ${actionLogs.filter(l => l.timestamp.getTime() > startTime).map(l => l.message).join('. ')}`;
+
+        const response = await ai.models.generateContent({
+          model: 'gemini-3-flash-preview',
+          contents: prompt
+        });
+
+        const summaryText = response.text?.trim() || "Brief session recorded.";
+        
+        const newSummary = {
+          user_number: phone,
+          user_name: name || "Unknown",
+          call_summary: summaryText,
+          duration: durationStr,
+          start_time: new Date(startTime).toISOString(),
+          end_time: new Date(endTime).toISOString(),
+          tech_issue_detected: false
+        };
+
+        const { data, error } = await supabase.from('user_call_summary').insert([newSummary]).select().single();
+        if (error) {
+          addActionLog(`Summary DB Error: ${error.message}`, 'error');
+          logToDebug('SUMMARY_SAVE_ERROR', { error: error.message, data: newSummary });
+        } else if (data) {
+          setSummaries(prev => [data, ...prev]);
+          logToDebug('SUMMARY_SAVED', { summary_id: data.call_id });
+        }
+      } catch (e: any) {
+        addActionLog(`Summary AI Error: ${e.message}`, 'error');
+        logToDebug('SUMMARY_AI_ERROR', { error: e.message });
       }
     }
 
     setSessionStartTime(null);
+    transcriptRef.current = [];
     if (sessionRef.current) try { await sessionRef.current.close(); } catch(e) {}
     sourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
     sourcesRef.current.clear();
     nextStartTimeRef.current = 0;
     addActionLog('Maya session concluded', 'info');
-  }, [patient, sessionStartTime, actionLogs, addActionLog]);
+    logToDebug('SESSION_ENDED', { duration_seconds: startTime ? Math.floor((Date.now() - startTime) / 1000) : 0 });
+  }, [patient, sessionStartTime, actionLogs, addActionLog, logToDebug]);
 
   const startMaya = async () => {
     if (isMayaActive || !patient) return;
@@ -145,6 +202,8 @@ const App: React.FC = () => {
     setIsMayaActive(true);
     setBotState('initiating');
     setSessionStartTime(Date.now());
+    transcriptRef.current = [];
+    logToDebug('SESSION_STARTED');
     
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
@@ -160,6 +219,7 @@ const App: React.FC = () => {
         callbacks: {
           onopen: () => {
             setBotState('listening');
+            logToDebug('WEBSOCKET_OPEN');
             const source = inCtx.createMediaStreamSource(stream);
             const scriptProcessor = inCtx.createScriptProcessor(4096, 1, 1);
             scriptProcessor.onaudioprocess = (e) => {
@@ -172,6 +232,13 @@ const App: React.FC = () => {
             scriptProcessor.connect(inCtx.destination);
           },
           onmessage: async (msg: LiveServerMessage) => {
+            if (msg.serverContent?.inputTranscription) {
+              transcriptRef.current.push(`User: ${msg.serverContent.inputTranscription.text}`);
+            }
+            if (msg.serverContent?.outputTranscription) {
+              transcriptRef.current.push(`Maya: ${msg.serverContent.outputTranscription.text}`);
+            }
+
             const base64Audio = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
             if (base64Audio) {
               setBotState('speaking');
@@ -192,6 +259,7 @@ const App: React.FC = () => {
             if (msg.toolCall?.functionCalls) {
               for (const fc of msg.toolCall.functionCalls) {
                 let result: any = "OK";
+                logToDebug('TOOL_CALL', { name: fc.name, args: fc.args });
                 
                 if (fc.name === 'get_doctors') {
                   const { data } = await supabase.from('doctors').select('*');
@@ -218,7 +286,7 @@ const App: React.FC = () => {
                   const { data, error } = await supabase.from('doctor_appointments').insert([newAppt]).select('*, doctors(*)').single();
                   if (data) {
                     setAppointments(prev => [data as any, ...prev]);
-                    result = `Success: Appointment booked for ${new Date(data.appointment_time).toLocaleString()}`;
+                    result = `Success: Appointment booked for ${formatIST(data.appointment_time, true)}`;
                     addActionLog(`Maya booked Doctor visit`, 'tool');
                   } else result = `Error: ${error?.message}`;
                 }
@@ -232,7 +300,7 @@ const App: React.FC = () => {
                   const { data, error } = await supabase.from('lab_appointments').insert([newAppt]).select('*, labs(*)').single();
                   if (data) {
                     setAppointments(prev => [data as any, ...prev]);
-                    result = `Success: Lab test booked for ${new Date(data.appointment_time).toLocaleString()}`;
+                    result = `Success: Lab test booked for ${formatIST(data.appointment_time, true)}`;
                     addActionLog(`Maya booked Lab test`, 'tool');
                   } else result = `Error: ${error?.message}`;
                 }
@@ -255,19 +323,29 @@ const App: React.FC = () => {
               }
             }
           },
-          onerror: (e) => { console.error(e); stopMaya(); },
-          onclose: () => stopMaya()
+          onerror: (e: any) => { 
+            console.error('Gemini error:', e); 
+            logToDebug('WEBSOCKET_ERROR', { message: e.message || 'Unknown error' });
+            stopMaya(); 
+          },
+          onclose: (e) => { 
+            logToDebug('WEBSOCKET_CLOSED', { code: e.code, reason: e.reason });
+            stopMaya(); 
+          }
         },
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } },
-          systemInstruction: SYSTEM_INSTRUCTION + `\n\nUSER CONTEXT:\nName: ${patient.name}\nPhone: ${patient.phone}\nTime: ${new Date().toLocaleString()}`,
-          tools: [{ functionDeclarations: TOOLS }]
+          systemInstruction: SYSTEM_INSTRUCTION + `\n\nUSER CONTEXT:\nName: ${patient.name}\nPhone: ${patient.phone}\nHospital Time (IST): ${formatIST(new Date().toISOString(), true)}`,
+          tools: [{ functionDeclarations: TOOLS }],
+          inputAudioTranscription: {},
+          outputAudioTranscription: {}
         }
       });
       sessionRef.current = await sessionPromise;
     } catch (e: any) { 
       console.error('Session start failed:', e);
+      logToDebug('SESSION_INIT_FAILED', { error: e.message });
       stopMaya(); 
     }
   };
@@ -280,57 +358,54 @@ const App: React.FC = () => {
 
   return (
     <div className="h-screen bg-[#FDFDFE] flex flex-col overflow-hidden text-slate-900">
-      <header className="px-8 py-6 border-b border-slate-100 flex items-center justify-between bg-white shrink-0 z-40">
-        <div className="flex items-center space-x-4">
-          <div className="bg-indigo-600 p-3 rounded-2xl shadow-lg">
-            <HeartPulse className="w-6 h-6 text-white" />
-          </div>
+      <header className="px-6 py-3 border-b border-slate-100 flex items-center justify-between bg-white shrink-0 z-40">
+        <div className="flex items-center space-x-3">
           <div>
-            <h1 className="text-xl font-black">Nurse Maya</h1>
-            <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Hospital Intelligence</p>
+            <h1 className="text-base font-black leading-tight">Nurse Maya</h1>
+            <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Hospital Intelligence (IST)</p>
           </div>
         </div>
-        <div className="flex items-center space-x-6">
+        <div className="flex items-center space-x-4">
           <div className="text-right hidden sm:block">
-            <p className="text-sm font-black">{patient.name}</p>
-            <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">{patient.phone}</p>
+            <p className="text-xs font-black">{patient.name}</p>
+            <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">{patient.phone}</p>
           </div>
-          <button onClick={() => setPatient(null)} className="p-3 rounded-2xl bg-slate-50 text-slate-400 hover:text-rose-500 transition-all">
-            <LogOut className="w-5 h-5" />
+          <button onClick={() => setPatient(null)} className="p-2 rounded-xl bg-slate-50 text-slate-400 hover:text-rose-500 transition-all">
+            <LogOut className="w-3.5 h-3.5" />
           </button>
         </div>
       </header>
 
       <main className="flex-1 overflow-y-auto scroll-smooth">
-        <div className="max-w-6xl mx-auto p-8 space-y-12 pb-32">
+        <div className="max-w-5xl mx-auto p-4 sm:p-6 space-y-8 pb-32">
           
           <section className="relative">
             {!isMayaActive ? (
-              <div className="bg-white rounded-[3rem] p-10 border border-slate-100 shadow-xl flex flex-col md:flex-row items-center justify-between space-y-8 md:space-y-0 md:space-x-12 animate-in fade-in slide-in-from-bottom-6">
-                <div className="flex-1 space-y-6">
-                  <div className="inline-flex items-center px-4 py-2 bg-indigo-50 text-indigo-600 rounded-full text-xs font-black uppercase tracking-widest">
-                    <Mic className="w-3 h-3 mr-2" /> Live Database Access
+              <div className="bg-white rounded-2xl p-6 border border-slate-100 shadow-lg flex flex-col md:flex-row items-center justify-between space-y-4 md:space-y-0 md:space-x-8 animate-in fade-in slide-in-from-bottom-4">
+                <div className="flex-1 space-y-3 text-center md:text-left">
+                  <div className="inline-flex items-center px-3 py-1 bg-indigo-50 text-indigo-600 rounded-full text-[9px] font-black uppercase tracking-widest">
+                    <Mic className="w-2.5 h-2.5 mr-1.5" /> Live Database Access
                   </div>
-                  <h2 className="text-4xl font-black tracking-tight leading-tight">Professional voice assistant for your health.</h2>
-                  <p className="text-lg text-slate-500 font-medium">Talk to Nurse Maya to browse specialists, schedule tests, or manage visits.</p>
+                  <p className="text-base text-slate-500 font-medium leading-normal max-w-xl">
+                    Talk to Receptionist Maya to browse OPD, doctors, labs; schedule appointments or lab tests, manage visits.
+                  </p>
                   <button 
                     onClick={startMaya}
-                    className="flex items-center space-x-4 bg-slate-900 hover:bg-indigo-600 text-white px-10 py-6 rounded-[2rem] font-black text-xl transition-all shadow-2xl group"
+                    className="flex items-center space-x-3 bg-slate-900 hover:bg-indigo-600 text-white px-6 py-3.5 rounded-xl font-black text-sm transition-all shadow-lg group mx-auto md:mx-0"
                   >
-                    <Mic className="w-6 h-6 group-hover:scale-110 transition-transform" />
+                    <Mic className="w-4 h-4 group-hover:scale-110 transition-transform" />
                     <span>Talk to Maya</span>
                   </button>
                 </div>
-                <div className="w-64 h-64 bg-slate-50 rounded-[4rem] border-2 border-dashed border-slate-200 flex items-center justify-center shrink-0">
-                   <HeartPulse className="w-20 h-20 text-slate-200" />
-                </div>
               </div>
             ) : (
-              <div className="bg-white rounded-[3rem] p-12 border border-slate-100 shadow-2xl flex flex-col items-center justify-center space-y-12 animate-in zoom-in">
-                <PulseOrb state={botState} />
+              <div className="bg-white rounded-[2.5rem] p-8 border border-slate-100 shadow-xl flex flex-col items-center justify-center space-y-8 animate-in zoom-in">
+                <div className="scale-75 origin-center">
+                   <PulseOrb state={botState} />
+                </div>
                 <button 
                   onClick={stopMaya}
-                  className="bg-rose-50 hover:bg-rose-100 text-rose-600 px-8 py-4 rounded-full font-black text-sm uppercase tracking-widest transition-all border border-rose-100"
+                  className="bg-rose-50 hover:bg-rose-100 text-rose-600 px-6 py-3 rounded-full font-black text-xs uppercase tracking-widest transition-all border border-rose-100"
                 >
                   End Conversation
                 </button>
@@ -338,54 +413,55 @@ const App: React.FC = () => {
             )}
           </section>
 
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-12">
-            <section className="space-y-6">
-              <h3 className="text-xl font-black flex items-center px-2"><Calendar className="w-6 h-6 mr-3 text-indigo-600" /> Upcoming Visits</h3>
-              <div className="space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <section className="space-y-4">
+              <h3 className="text-lg font-black flex items-center px-1"><Calendar className="w-5 h-5 mr-2.5 text-indigo-600" /> Upcoming</h3>
+              <div className="space-y-3">
                 {upcoming.length === 0 ? (
-                  <div className="bg-slate-50 border-2 border-dashed border-slate-100 rounded-[2.5rem] p-12 text-center text-slate-400 font-bold">
-                    No upcoming doctor or lab visits.
+                  <div className="bg-slate-50/50 border border-dashed border-slate-200 rounded-2xl p-8 text-center text-slate-400 text-sm font-bold">
+                    No upcoming visits.
                   </div>
                 ) : (
                   upcoming.map(app => (
-                    <div key={app.id} className="bg-white border border-slate-100 p-6 rounded-[2rem] flex items-center justify-between hover:shadow-xl transition-all">
-                      <div className="flex items-center space-x-6">
-                        <div className="w-16 h-16 rounded-2xl bg-indigo-50 flex items-center justify-center text-indigo-600">
-                          {app.lab_id ? <FlaskConical className="w-8 h-8" /> : <User className="w-8 h-8" />}
+                    <div key={app.id} className="bg-white border border-slate-100 p-4 rounded-xl flex items-center justify-between hover:shadow-md transition-all group">
+                      <div className="flex items-center space-x-4 min-w-0">
+                        <div className="w-10 h-10 rounded-lg bg-indigo-50 flex items-center justify-center text-indigo-600 shrink-0">
+                          {app.lab_id ? <FlaskConical className="w-5 h-5" /> : <User className="w-5 h-5" />}
                         </div>
-                        <div>
-                          <h4 className="font-black text-slate-900 text-lg">
+                        <div className="min-w-0">
+                          <h4 className="font-bold text-slate-900 text-sm truncate">
                             {app.doctors?.name || app.labs?.test_name || 'Medical Visit'}
                           </h4>
-                          <p className="text-xs font-bold text-indigo-600 uppercase mt-1">
-                            {new Date(app.appointment_time).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                          <p className="text-[10px] font-black text-indigo-600 uppercase tracking-tight mt-0.5">
+                            {formatIST(app.appointment_time, true)}
                           </p>
                         </div>
                       </div>
+                      <ChevronRight className="w-4 h-4 text-slate-200 group-hover:text-indigo-400 group-hover:translate-x-1 transition-all" />
                     </div>
                   ))
                 )}
               </div>
             </section>
 
-            <section className="space-y-6">
-              <h3 className="text-xl font-black text-slate-400 flex items-center px-2"><History className="w-6 h-6 mr-3" /> Past Records</h3>
-              <div className="space-y-4">
+            <section className="space-y-4">
+              <h3 className="text-lg font-black text-slate-400 flex items-center px-1"><History className="w-5 h-5 mr-2.5" /> Past Records</h3>
+              <div className="space-y-3">
                 {past.length === 0 ? (
-                  <div className="bg-slate-50 border-2 border-dashed border-slate-100 rounded-[2.5rem] p-12 text-center text-slate-400 font-bold opacity-50">
+                  <div className="bg-slate-50/50 border border-dashed border-slate-200 rounded-2xl p-8 text-center text-slate-400 text-sm font-bold opacity-50">
                     No history found.
                   </div>
                 ) : (
                   past.map(app => (
-                    <div key={app.id} className="bg-white/50 border border-slate-100 p-6 rounded-[2rem] flex items-center justify-between opacity-70">
-                      <div className="flex items-center space-x-6">
-                        <div className="w-16 h-16 rounded-2xl bg-slate-100 flex items-center justify-center text-slate-400">
-                          {app.status === 'cancelled' ? <AlertCircle className="w-8 h-8" /> : <CheckCircle2 className="w-8 h-8" />}
+                    <div key={app.id} className="bg-white/50 border border-slate-100 p-4 rounded-xl flex items-center justify-between opacity-75 hover:opacity-100 transition-all">
+                      <div className="flex items-center space-x-4 min-w-0">
+                        <div className="w-10 h-10 rounded-lg bg-slate-50 flex items-center justify-center text-slate-400 shrink-0">
+                          {app.status === 'cancelled' ? <AlertCircle className="w-5 h-5" /> : <CheckCircle2 className="w-5 h-5" />}
                         </div>
-                        <div>
-                          <h4 className="font-bold text-slate-700">{app.doctors?.name || app.labs?.test_name}</h4>
-                          <p className="text-[10px] font-black text-slate-400 uppercase mt-1">
-                            {app.status.toUpperCase()} • {new Date(app.appointment_time).toLocaleDateString()}
+                        <div className="min-w-0">
+                          <h4 className="font-bold text-slate-600 text-sm truncate">{app.doctors?.name || app.labs?.test_name}</h4>
+                          <p className="text-[9px] font-black text-slate-400 uppercase tracking-tighter mt-0.5">
+                            {app.status.toUpperCase()} • {formatIST(app.appointment_time)}
                           </p>
                         </div>
                       </div>
@@ -396,23 +472,29 @@ const App: React.FC = () => {
             </section>
           </div>
 
-          <section className="space-y-8 pb-20">
-            <h3 className="text-xl font-black flex items-center px-2"><MessageSquare className="w-6 h-6 mr-3 text-indigo-600" /> Call Summaries</h3>
-            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
+          <section className="space-y-5">
+            <h3 className="text-lg font-black flex items-center px-1"><MessageSquare className="w-5 h-5 mr-2.5 text-indigo-600" /> Call Summaries</h3>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
               {summaries.length === 0 ? (
-                <div className="col-span-full bg-slate-50 border-2 border-dashed rounded-[2.5rem] p-12 text-center text-slate-400 font-bold">
-                  No saved summaries yet.
+                <div className="col-span-full bg-slate-50 border border-dashed border-slate-200 rounded-2xl p-8 text-center text-slate-400 text-sm font-bold">
+                  No summaries yet.
                 </div>
               ) : (
                 summaries.map(summary => (
-                  <div key={summary.call_id} className="bg-white border border-slate-100 p-8 rounded-[2.5rem] space-y-4 hover:shadow-xl transition-all">
+                  <div key={summary.call_id} className="bg-white border border-slate-100 p-5 rounded-xl space-y-3 hover:shadow-lg transition-all border-b-2 hover:border-indigo-200">
                     <div className="flex items-center justify-between">
-                      <div className="p-3 bg-indigo-50 rounded-2xl text-indigo-600"><MessageSquare className="w-5 h-5" /></div>
-                      <p className="text-[10px] font-black text-slate-400 uppercase">{new Date(summary.created_at).toLocaleDateString()}</p>
+                      <div className="p-2 bg-indigo-50 rounded-lg text-indigo-600"><MessageSquare className="w-3.5 h-3.5" /></div>
+                      <p className="text-[9px] font-black text-slate-400 uppercase">{formatIST(summary.created_at)}</p>
                     </div>
-                    <p className="text-slate-700 font-medium italic">"{summary.call_summary}"</p>
-                    <div className="text-[10px] font-black text-slate-400 uppercase">
-                      <Timer className="w-3 h-3 inline mr-1" /> {summary.duration}
+                    <div className="space-y-1">
+                      <p className="text-xs text-slate-700 font-medium italic leading-relaxed line-clamp-3">"{summary.call_summary}"</p>
+                      {/* Added start time specifically in summary card as requested */}
+                      <p className="text-[10px] font-black text-indigo-600 uppercase tracking-tight">
+                        Started: {formatIST(summary.start_time, true)}
+                      </p>
+                    </div>
+                    <div className="flex items-center text-[9px] font-black text-slate-400 uppercase tracking-tighter pt-1">
+                      <Timer className="w-3 h-3 mr-1.5" /> {summary.duration}
                     </div>
                   </div>
                 ))
@@ -423,14 +505,14 @@ const App: React.FC = () => {
         </div>
       </main>
 
-      <div className="fixed bottom-8 right-8 z-50 group">
-        <div className="absolute bottom-full right-0 mb-4 w-[350px] opacity-0 group-hover:opacity-100 pointer-events-none group-hover:pointer-events-auto transition-all translate-y-4 group-hover:translate-y-0">
-          <div className="h-[400px] bg-white rounded-[2rem] shadow-2xl border border-slate-100 overflow-hidden">
+      <div className="fixed bottom-6 right-6 z-50 group">
+        <div className="absolute bottom-full right-0 mb-4 w-[320px] opacity-0 group-hover:opacity-100 pointer-events-none group-hover:pointer-events-auto transition-all translate-y-4 group-hover:translate-y-0">
+          <div className="h-[350px] bg-white rounded-2xl shadow-2xl border border-slate-100 overflow-hidden">
             <ActionLog logs={actionLogs} />
           </div>
         </div>
-        <button className="bg-slate-900 text-white p-5 rounded-2xl shadow-2xl hover:bg-indigo-600 transition-colors">
-          <Activity className="w-6 h-6" />
+        <button className="bg-slate-900 text-white p-4 rounded-xl shadow-2xl hover:bg-indigo-600 transition-colors">
+          <Activity className="w-5 h-5" />
         </button>
       </div>
     </div>
