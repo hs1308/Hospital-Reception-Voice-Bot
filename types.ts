@@ -1,35 +1,46 @@
 
 export interface Patient {
-  id: string;
   phone: string;
   name: string;
   created_at?: string;
 }
 
-export interface Appointment {
+export interface Doctor {
   id: string;
-  patient_id: string;
-  doctor_name: string;
-  department: string;
-  appointment_time: string;
-  reason?: string;
-  status: 'scheduled' | 'completed' | 'cancelled';
+  name: string;
+  specialty: string;
+  bio: string;
+  fee: number;
 }
 
-export interface DebugLog {
-  id?: string;
-  patient_id?: string;
-  message: string;
-  type: 'tool' | 'info' | 'error';
-  timestamp: string;
+export interface Lab {
+  id: string;
+  test_name: string;
+  price: number;
+  instructions: string;
+}
+
+export interface Appointment {
+  id: string;
+  patient_phone: string;
+  doctor_id?: string;
+  lab_id?: string;
+  appointment_time: string;
+  status: 'scheduled' | 'completed' | 'cancelled';
+  // Joined fields for UI
+  doctors?: Doctor;
+  labs?: Lab;
 }
 
 export interface ChatSummary {
-  id?: string;
-  patient_id: string;
-  summary: string;
-  duration_seconds: number;
-  timestamp: string;
+  call_id: string;
+  user_number: string;
+  user_name: string;
+  call_summary: string;
+  duration: string;
+  start_time: string;
+  end_time: string;
+  created_at: string;
 }
 
 export type BotState = 'idle' | 'initiating' | 'listening' | 'speaking' | 'processing';

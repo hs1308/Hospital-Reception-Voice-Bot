@@ -13,7 +13,7 @@ import {
   Mic, HeartPulse, ShieldCheck,
   ChevronRight, AlertCircle, CheckCircle2,
   Activity, WifiOff, Volume2, MessageSquare,
-  History, Timer
+  History, Timer, FlaskConical, MapPin
 } from 'lucide-react';
 
 function encode(bytes: Uint8Array) {
@@ -48,7 +48,6 @@ const App: React.FC = () => {
   const [botState, setBotState] = useState<BotState>('idle');
   const [actionLogs, setActionLogs] = useState<LogType[]>([]);
   const [isMayaActive, setIsMayaActive] = useState(false);
-  const [noiseLevel, setNoiseLevel] = useState(0);
   const [sessionStartTime, setSessionStartTime] = useState<number | null>(null);
 
   const inputAudioContextRef = useRef<AudioContext | null>(null);
@@ -56,42 +55,56 @@ const App: React.FC = () => {
   const sessionRef = useRef<any>(null);
   const nextStartTimeRef = useRef(0);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
-  const analyzerRef = useRef<AnalyserNode | null>(null);
 
   const addActionLog = useCallback((message: string, type: 'tool' | 'info' | 'error' = 'info') => {
     const newLog: LogType = { id: Math.random().toString(36).substr(2, 9), timestamp: new Date(), message, type };
-    setActionLogs(prev => [newLog, ...prev.slice(0, 15)]);
+    setActionLogs(prev => [newLog, ...prev.slice(0, 20)]);
   }, []);
 
-  const fetchData = useCallback(async (patientId: string) => {
+  const fetchData = useCallback(async (phone: string) => {
     if (!isSupabaseConfigured()) return;
     
-    const { data: apptData, error: apptError } = await supabase
-      .from('appointments')
-      .select('*')
-      .eq('patient_id', patientId)
+    // Fetch Doctor Appointments joined with Doctors
+    const { data: drData, error: drError } = await supabase
+      .from('doctor_appointments')
+      .select('*, doctors(*)')
+      .eq('patient_phone', phone)
       .order('appointment_time', { ascending: false });
     
-    if (!apptError && apptData) setAppointments(apptData);
+    // Fetch Lab Appointments joined with Labs
+    const { data: labData } = await supabase
+      .from('lab_appointments')
+      .select('*, labs(*)')
+      .eq('patient_phone', phone)
+      .order('appointment_time', { ascending: false });
 
+    if (drError) addActionLog(`Sync Error: ${drError.message}`, 'error');
+    
+    const combined = [
+      ...(drData || []).map(a => ({ ...a, type: 'doctor' })),
+      ...(labData || []).map(a => ({ ...a, type: 'lab' }))
+    ].sort((a, b) => new Date(b.appointment_time).getTime() - new Date(a.appointment_time).getTime());
+
+    setAppointments(combined as any);
+
+    // Fetch Summaries from user_call_summary
     const { data: summaryData } = await supabase
-      .from('user_chat_summaries')
+      .from('user_call_summary')
       .select('*')
-      .eq('patient_id', patientId)
-      .order('timestamp', { ascending: false });
+      .eq('user_number', phone)
+      .order('created_at', { ascending: false });
     
     if (summaryData) setSummaries(summaryData);
-  }, []);
+  }, [addActionLog]);
 
   useEffect(() => {
-    if (patient) fetchData(patient.id);
+    if (patient) fetchData(patient.phone);
   }, [patient, fetchData]);
 
   const stopMaya = useCallback(async () => {
     setBotState('idle');
     setIsMayaActive(false);
     
-    // Auto-save summary
     if (patient && sessionStartTime) {
       const transcript = actionLogs.filter(l => l.timestamp.getTime() > sessionStartTime).map(l => l.message).join('. ');
       if (transcript) {
@@ -101,15 +114,18 @@ const App: React.FC = () => {
             model: 'gemini-3-flash-preview',
             contents: `Summarize this interaction (max 15 words): ${transcript}`
           });
+          const duration = Math.floor((Date.now() - sessionStartTime) / 1000);
           const newSummary = {
-            patient_id: patient.id,
-            summary: response.text || "Routine session",
-            duration_seconds: Math.floor((Date.now() - sessionStartTime) / 1000),
-            timestamp: new Date().toISOString()
+            user_number: patient.phone,
+            user_name: patient.name,
+            call_summary: response.text || "Routine medical session",
+            duration: `${duration} seconds`,
+            start_time: new Date(sessionStartTime).toISOString(),
+            end_time: new Date().toISOString()
           };
-          const { data } = await supabase.from('user_chat_summaries').insert([newSummary]).select().single();
+          const { data } = await supabase.from('user_call_summary').insert([newSummary]).select().single();
           if (data) setSummaries(prev => [data, ...prev]);
-        } catch (e) { console.error(e); }
+        } catch (e) { console.error('Summary persist failed:', e); }
       }
     }
 
@@ -118,14 +134,13 @@ const App: React.FC = () => {
     sourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
     sourcesRef.current.clear();
     nextStartTimeRef.current = 0;
-    addActionLog('Maya session ended', 'info');
+    addActionLog('Maya session concluded', 'info');
   }, [patient, sessionStartTime, actionLogs, addActionLog]);
 
   const startMaya = async () => {
     if (isMayaActive || !patient) return;
     
-    // Refresh context before starting
-    await fetchData(patient.id);
+    await fetchData(patient.phone);
 
     setIsMayaActive(true);
     setBotState('initiating');
@@ -146,11 +161,6 @@ const App: React.FC = () => {
           onopen: () => {
             setBotState('listening');
             const source = inCtx.createMediaStreamSource(stream);
-            const analyzer = inCtx.createAnalyser();
-            analyzer.fftSize = 256;
-            source.connect(analyzer);
-            analyzerRef.current = analyzer;
-
             const scriptProcessor = inCtx.createScriptProcessor(4096, 1, 1);
             scriptProcessor.onaudioprocess = (e) => {
               const inputData = e.inputBuffer.getChannelData(0);
@@ -183,43 +193,59 @@ const App: React.FC = () => {
               for (const fc of msg.toolCall.functionCalls) {
                 let result: any = "OK";
                 
-                if (fc.name === 'book_appointment') {
+                if (fc.name === 'get_doctors') {
+                  const { data } = await supabase.from('doctors').select('*');
+                  result = data;
+                  addActionLog('Maya checked Doctors database', 'tool');
+                }
+                else if (fc.name === 'get_labs') {
+                  const { data } = await supabase.from('labs').select('*');
+                  result = data;
+                  addActionLog('Maya checked Lab database', 'tool');
+                }
+                else if (fc.name === 'get_opd_timings') {
+                  const { data } = await supabase.from('opd_timings').select('*');
+                  result = data;
+                  addActionLog('Maya checked OPD timings', 'tool');
+                }
+                else if (fc.name === 'book_doctor_appointment') {
                   const newAppt = {
-                    patient_id: patient.id,
-                    department: fc.args.department || 'General Medicine',
-                    doctor_name: fc.args.doctor_name || 'Dr. Smith',
+                    patient_phone: patient.phone,
+                    doctor_id: fc.args.doctor_id,
                     appointment_time: fc.args.appointment_time,
-                    reason: fc.args.reason || 'Routine Checkup',
                     status: 'scheduled'
                   };
-                  const { data } = await supabase.from('appointments').insert([newAppt]).select().single();
+                  const { data, error } = await supabase.from('doctor_appointments').insert([newAppt]).select('*, doctors(*)').single();
                   if (data) {
-                    setAppointments(prev => [data, ...prev]);
-                    result = `Confirmed: ${data.department} at ${new Date(data.appointment_time).toLocaleString()}`;
-                    addActionLog(`Maya booked ${data.department}`, 'tool');
-                  } else result = "Failed to save to database.";
-                } 
+                    setAppointments(prev => [data as any, ...prev]);
+                    result = `Success: Appointment booked for ${new Date(data.appointment_time).toLocaleString()}`;
+                    addActionLog(`Maya booked Doctor visit`, 'tool');
+                  } else result = `Error: ${error?.message}`;
+                }
+                else if (fc.name === 'book_lab_appointment') {
+                  const newAppt = {
+                    patient_phone: patient.phone,
+                    lab_id: fc.args.lab_id,
+                    appointment_time: fc.args.appointment_time,
+                    status: 'scheduled'
+                  };
+                  const { data, error } = await supabase.from('lab_appointments').insert([newAppt]).select('*, labs(*)').single();
+                  if (data) {
+                    setAppointments(prev => [data as any, ...prev]);
+                    result = `Success: Lab test booked for ${new Date(data.appointment_time).toLocaleString()}`;
+                    addActionLog(`Maya booked Lab test`, 'tool');
+                  } else result = `Error: ${error?.message}`;
+                }
                 else if (fc.name === 'get_patient_appointments') {
-                  // FRESH FETCH to avoid hallucinations
-                  const { data } = await supabase.from('appointments').select('*').eq('patient_id', patient.id).order('appointment_time', { ascending: false });
-                  result = data && data.length > 0 
-                    ? data.map(a => `ID: ${a.id} | ${a.department} w/ ${a.doctor_name} on ${new Date(a.appointment_time).toLocaleString()} (${a.status})`).join('\n')
-                    : "No appointments found.";
+                  await fetchData(patient.phone);
+                  result = appointments.length > 0 ? appointments : "No appointments found.";
                   addActionLog('Maya fetched live history', 'tool');
                 }
-                else if (fc.name === 'reschedule_appointment') {
-                   const { data } = await supabase.from('appointments').update({ appointment_time: fc.args.new_appointment_time }).eq('id', fc.args.appointment_id).select().single();
-                   if (data) {
-                     setAppointments(prev => prev.map(a => a.id === data.id ? data : a));
-                     result = "Updated to " + new Date(data.appointment_time).toLocaleString();
-                     addActionLog(`Maya rescheduled appointment ${data.id}`, 'tool');
-                   } else result = "Appointment ID not found.";
-                }
                 else if (fc.name === 'cancel_appointment') {
-                  await supabase.from('appointments').update({ status: 'cancelled' }).eq('id', fc.args.appointment_id);
+                  await supabase.from('doctor_appointments').update({ status: 'cancelled' }).eq('id', fc.args.appointment_id);
                   setAppointments(prev => prev.map(a => a.id === fc.args.appointment_id ? { ...a, status: 'cancelled' } : a));
-                  result = "Appointment cancelled.";
-                  addActionLog(`Maya cancelled appointment ${fc.args.appointment_id}`, 'tool');
+                  result = "Cancelled.";
+                  addActionLog('Maya cancelled visit', 'tool');
                 }
                 else if (fc.name === 'hang_up') {
                   stopMaya();
@@ -235,12 +261,15 @@ const App: React.FC = () => {
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } },
-          systemInstruction: SYSTEM_INSTRUCTION + `\n\nCONTEXT:\nPatient: ${patient.name}\nTime: ${new Date().toLocaleString()}`,
+          systemInstruction: SYSTEM_INSTRUCTION + `\n\nUSER CONTEXT:\nName: ${patient.name}\nPhone: ${patient.phone}\nTime: ${new Date().toLocaleString()}`,
           tools: [{ functionDeclarations: TOOLS }]
         }
       });
       sessionRef.current = await sessionPromise;
-    } catch (e: any) { stopMaya(); }
+    } catch (e: any) { 
+      console.error('Session start failed:', e);
+      stopMaya(); 
+    }
   };
 
   const now = new Date();
@@ -250,101 +279,159 @@ const App: React.FC = () => {
   if (!patient) return <div className="h-screen bg-slate-50 flex items-center justify-center p-6"><PatientSetup onComplete={setPatient} /></div>;
 
   return (
-    <div className="h-screen bg-[#FDFDFE] flex flex-col overflow-hidden">
-      {!isSupabaseConfigured() && (
-        <div className="bg-amber-500 text-white px-6 py-2 flex items-center justify-center space-x-2 text-xs font-black uppercase tracking-widest shrink-0">
-          <WifiOff className="w-4 h-4" />
-          <span>Database Keys Missing</span>
-        </div>
-      )}
-
-      <header className="px-8 py-6 border-b border-slate-100 flex items-center justify-between bg-white shrink-0">
+    <div className="h-screen bg-[#FDFDFE] flex flex-col overflow-hidden text-slate-900">
+      <header className="px-8 py-6 border-b border-slate-100 flex items-center justify-between bg-white shrink-0 z-40">
         <div className="flex items-center space-x-4">
-          <div className="bg-indigo-600 p-3 rounded-2xl"><HeartPulse className="w-6 h-6 text-white" /></div>
-          <div><h1 className="text-xl font-black">Nurse Maya</h1><p className="text-[10px] font-black text-slate-400 uppercase">City General</p></div>
+          <div className="bg-indigo-600 p-3 rounded-2xl shadow-lg">
+            <HeartPulse className="w-6 h-6 text-white" />
+          </div>
+          <div>
+            <h1 className="text-xl font-black">Nurse Maya</h1>
+            <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Hospital Intelligence</p>
+          </div>
         </div>
-        <button onClick={() => setPatient(null)} className="p-3 rounded-2xl bg-slate-50 text-slate-400 hover:text-rose-500 transition-all"><LogOut className="w-5 h-5" /></button>
+        <div className="flex items-center space-x-6">
+          <div className="text-right hidden sm:block">
+            <p className="text-sm font-black">{patient.name}</p>
+            <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">{patient.phone}</p>
+          </div>
+          <button onClick={() => setPatient(null)} className="p-3 rounded-2xl bg-slate-50 text-slate-400 hover:text-rose-500 transition-all">
+            <LogOut className="w-5 h-5" />
+          </button>
+        </div>
       </header>
 
       <main className="flex-1 overflow-y-auto scroll-smooth">
-        <div className="max-w-6xl mx-auto p-8 space-y-12">
+        <div className="max-w-6xl mx-auto p-8 space-y-12 pb-32">
           
-          <section>
+          <section className="relative">
             {!isMayaActive ? (
               <div className="bg-white rounded-[3rem] p-10 border border-slate-100 shadow-xl flex flex-col md:flex-row items-center justify-between space-y-8 md:space-y-0 md:space-x-12 animate-in fade-in slide-in-from-bottom-6">
                 <div className="flex-1 space-y-6">
-                  <div className="inline-flex items-center px-4 py-2 bg-indigo-50 text-indigo-600 rounded-full text-xs font-black uppercase tracking-widest"><Mic className="w-3 h-3 mr-2" /> AI Voice Assistant</div>
-                  <h2 className="text-4xl font-black tracking-tight leading-tight">Manage your appointments by voice.</h2>
-                  <button onClick={startMaya} className="flex items-center space-x-4 bg-slate-900 hover:bg-indigo-600 text-white px-10 py-6 rounded-[2rem] font-black text-xl transition-all shadow-2xl group">
-                    <Mic className="w-6 h-6 group-hover:scale-110" /><span>Talk to Maya</span>
+                  <div className="inline-flex items-center px-4 py-2 bg-indigo-50 text-indigo-600 rounded-full text-xs font-black uppercase tracking-widest">
+                    <Mic className="w-3 h-3 mr-2" /> Live Database Access
+                  </div>
+                  <h2 className="text-4xl font-black tracking-tight leading-tight">Professional voice assistant for your health.</h2>
+                  <p className="text-lg text-slate-500 font-medium">Talk to Nurse Maya to browse specialists, schedule tests, or manage visits.</p>
+                  <button 
+                    onClick={startMaya}
+                    className="flex items-center space-x-4 bg-slate-900 hover:bg-indigo-600 text-white px-10 py-6 rounded-[2rem] font-black text-xl transition-all shadow-2xl group"
+                  >
+                    <Mic className="w-6 h-6 group-hover:scale-110 transition-transform" />
+                    <span>Talk to Maya</span>
                   </button>
                 </div>
-                <div className="w-64 h-64 bg-slate-50 rounded-[4rem] border-2 border-dashed border-slate-200 flex items-center justify-center shrink-0"><Mic className="w-20 h-20 text-slate-200" /></div>
+                <div className="w-64 h-64 bg-slate-50 rounded-[4rem] border-2 border-dashed border-slate-200 flex items-center justify-center shrink-0">
+                   <HeartPulse className="w-20 h-20 text-slate-200" />
+                </div>
               </div>
             ) : (
-              <div className="bg-white rounded-[3rem] p-12 border border-slate-100 shadow-2xl flex flex-col items-center space-y-12 animate-in zoom-in">
+              <div className="bg-white rounded-[3rem] p-12 border border-slate-100 shadow-2xl flex flex-col items-center justify-center space-y-12 animate-in zoom-in">
                 <PulseOrb state={botState} />
-                <button onClick={stopMaya} className="bg-rose-50 hover:bg-rose-100 text-rose-600 px-8 py-4 rounded-full font-black text-sm uppercase tracking-widest border border-rose-100">End Conversation</button>
+                <button 
+                  onClick={stopMaya}
+                  className="bg-rose-50 hover:bg-rose-100 text-rose-600 px-8 py-4 rounded-full font-black text-sm uppercase tracking-widest transition-all border border-rose-100"
+                >
+                  End Conversation
+                </button>
               </div>
             )}
           </section>
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-12">
             <section className="space-y-6">
-              <h3 className="text-xl font-black px-2 flex items-center"><Calendar className="w-6 h-6 mr-3 text-indigo-600" /> Upcoming Visits</h3>
+              <h3 className="text-xl font-black flex items-center px-2"><Calendar className="w-6 h-6 mr-3 text-indigo-600" /> Upcoming Visits</h3>
               <div className="space-y-4">
-                {upcoming.length === 0 ? <div className="bg-slate-50 border-2 border-dashed rounded-[2.5rem] p-12 text-center text-slate-400 font-bold">No upcoming visits.</div> : 
+                {upcoming.length === 0 ? (
+                  <div className="bg-slate-50 border-2 border-dashed border-slate-100 rounded-[2.5rem] p-12 text-center text-slate-400 font-bold">
+                    No upcoming doctor or lab visits.
+                  </div>
+                ) : (
                   upcoming.map(app => (
-                    <div key={app.id} className="bg-white border border-slate-100 p-6 rounded-[2rem] flex items-center justify-between group hover:border-indigo-200 hover:shadow-xl transition-all">
+                    <div key={app.id} className="bg-white border border-slate-100 p-6 rounded-[2rem] flex items-center justify-between hover:shadow-xl transition-all">
                       <div className="flex items-center space-x-6">
-                        <div className="w-16 h-16 rounded-2xl bg-indigo-50 flex items-center justify-center text-indigo-600"><User className="w-8 h-8" /></div>
+                        <div className="w-16 h-16 rounded-2xl bg-indigo-50 flex items-center justify-center text-indigo-600">
+                          {app.lab_id ? <FlaskConical className="w-8 h-8" /> : <User className="w-8 h-8" />}
+                        </div>
                         <div>
-                          <h4 className="font-black text-slate-900 text-lg">{app.doctor_name}</h4>
-                          <p className="text-xs text-slate-500 font-bold">{app.department} • {new Date(app.appointment_time).toLocaleString()}</p>
+                          <h4 className="font-black text-slate-900 text-lg">
+                            {app.doctors?.name || app.labs?.test_name || 'Medical Visit'}
+                          </h4>
+                          <p className="text-xs font-bold text-indigo-600 uppercase mt-1">
+                            {new Date(app.appointment_time).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                          </p>
                         </div>
                       </div>
                     </div>
-                  ))}
+                  ))
+                )}
               </div>
             </section>
 
             <section className="space-y-6">
-              <h3 className="text-xl font-black px-2 flex items-center text-slate-400"><History className="w-6 h-6 mr-3" /> History</h3>
+              <h3 className="text-xl font-black text-slate-400 flex items-center px-2"><History className="w-6 h-6 mr-3" /> Past Records</h3>
               <div className="space-y-4">
-                {past.length === 0 ? <div className="bg-slate-50 border-2 border-dashed rounded-[2.5rem] p-12 text-center text-slate-400 font-bold opacity-50">No history found.</div> : 
+                {past.length === 0 ? (
+                  <div className="bg-slate-50 border-2 border-dashed border-slate-100 rounded-[2.5rem] p-12 text-center text-slate-400 font-bold opacity-50">
+                    No history found.
+                  </div>
+                ) : (
                   past.map(app => (
                     <div key={app.id} className="bg-white/50 border border-slate-100 p-6 rounded-[2rem] flex items-center justify-between opacity-70">
                       <div className="flex items-center space-x-6">
-                        <div className="w-16 h-16 rounded-2xl bg-slate-100 flex items-center justify-center text-slate-400">{app.status === 'cancelled' ? <AlertCircle className="w-8 h-8" /> : <CheckCircle2 className="w-8 h-8" />}</div>
-                        <div><h4 className="font-bold text-slate-700">{app.doctor_name}</h4><p className="text-[10px] font-black text-slate-400 uppercase mt-1">{app.status.toUpperCase()} • {new Date(app.appointment_time).toLocaleDateString()}</p></div>
+                        <div className="w-16 h-16 rounded-2xl bg-slate-100 flex items-center justify-center text-slate-400">
+                          {app.status === 'cancelled' ? <AlertCircle className="w-8 h-8" /> : <CheckCircle2 className="w-8 h-8" />}
+                        </div>
+                        <div>
+                          <h4 className="font-bold text-slate-700">{app.doctors?.name || app.labs?.test_name}</h4>
+                          <p className="text-[10px] font-black text-slate-400 uppercase mt-1">
+                            {app.status.toUpperCase()} • {new Date(app.appointment_time).toLocaleDateString()}
+                          </p>
+                        </div>
                       </div>
                     </div>
-                  ))}
+                  ))
+                )}
               </div>
             </section>
           </div>
 
           <section className="space-y-8 pb-20">
-            <h3 className="text-xl font-black px-2 flex items-center"><MessageSquare className="w-6 h-6 mr-3 text-indigo-600" /> Maya Call Summaries</h3>
+            <h3 className="text-xl font-black flex items-center px-2"><MessageSquare className="w-6 h-6 mr-3 text-indigo-600" /> Call Summaries</h3>
             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
-              {summaries.length === 0 ? <div className="col-span-full bg-slate-50 border-2 border-dashed rounded-[2.5rem] p-12 text-center text-slate-400 font-bold">No archived conversations.</div> : 
+              {summaries.length === 0 ? (
+                <div className="col-span-full bg-slate-50 border-2 border-dashed rounded-[2.5rem] p-12 text-center text-slate-400 font-bold">
+                  No saved summaries yet.
+                </div>
+              ) : (
                 summaries.map(summary => (
-                  <div key={summary.id} className="bg-white border border-slate-100 p-8 rounded-[2.5rem] space-y-4 hover:shadow-xl transition-all">
-                    <div className="flex items-center justify-between"><div className="p-3 bg-indigo-50 rounded-2xl text-indigo-600"><MessageSquare className="w-5 h-5" /></div><p className="text-[10px] font-black text-slate-400 uppercase">{new Date(summary.timestamp).toLocaleDateString()}</p></div>
-                    <p className="text-slate-700 font-medium italic">"{summary.summary}"</p>
-                    <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest"><Timer className="w-3 h-3 inline mr-1" /> {summary.duration_seconds}s call</p>
+                  <div key={summary.call_id} className="bg-white border border-slate-100 p-8 rounded-[2.5rem] space-y-4 hover:shadow-xl transition-all">
+                    <div className="flex items-center justify-between">
+                      <div className="p-3 bg-indigo-50 rounded-2xl text-indigo-600"><MessageSquare className="w-5 h-5" /></div>
+                      <p className="text-[10px] font-black text-slate-400 uppercase">{new Date(summary.created_at).toLocaleDateString()}</p>
+                    </div>
+                    <p className="text-slate-700 font-medium italic">"{summary.call_summary}"</p>
+                    <div className="text-[10px] font-black text-slate-400 uppercase">
+                      <Timer className="w-3 h-3 inline mr-1" /> {summary.duration}
+                    </div>
                   </div>
-                ))}
+                ))
+              )}
             </div>
           </section>
+
         </div>
       </main>
 
       <div className="fixed bottom-8 right-8 z-50 group">
         <div className="absolute bottom-full right-0 mb-4 w-[350px] opacity-0 group-hover:opacity-100 pointer-events-none group-hover:pointer-events-auto transition-all translate-y-4 group-hover:translate-y-0">
-          <div className="h-[400px] bg-white rounded-[2rem] shadow-2xl border border-slate-100 overflow-hidden"><ActionLog logs={actionLogs} /></div>
+          <div className="h-[400px] bg-white rounded-[2rem] shadow-2xl border border-slate-100 overflow-hidden">
+            <ActionLog logs={actionLogs} />
+          </div>
         </div>
-        <button className="bg-slate-900 text-white p-5 rounded-2xl shadow-2xl hover:bg-indigo-600 transition-colors"><Activity className="w-6 h-6" /></button>
+        <button className="bg-slate-900 text-white p-5 rounded-2xl shadow-2xl hover:bg-indigo-600 transition-colors">
+          <Activity className="w-6 h-6" />
+        </button>
       </div>
     </div>
   );
