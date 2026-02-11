@@ -55,24 +55,6 @@ const formatFriendlyIST = (dateStr: string | undefined) => {
   }).format(date).replace(' at ', ', ');
 };
 
-// Keep old formatter for DD/MM/YYYY if needed elsewhere
-const formatIST = (dateStr: string | undefined, includeTime: boolean = false) => {
-  if (!dateStr) return 'N/A';
-  const date = new Date(dateStr);
-  const options: Intl.DateTimeFormatOptions = {
-    timeZone: 'Asia/Kolkata',
-    day: '2-digit',
-    month: '2-digit',
-    year: 'numeric',
-  };
-  if (includeTime) {
-    options.hour = '2-digit';
-    options.minute = '2-digit';
-    options.hour12 = true;
-  }
-  return new Intl.DateTimeFormat('en-GB', options).format(date);
-};
-
 const App: React.FC = () => {
   const [patient, setPatient] = useState<Patient | null>(null);
   const [appointments, setAppointments] = useState<Appointment[]>([]);
@@ -88,6 +70,28 @@ const App: React.FC = () => {
   const nextStartTimeRef = useRef(0);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const transcriptRef = useRef<string[]>([]);
+
+  // Session Persistence
+  useEffect(() => {
+    const saved = localStorage.getItem('nurse_maya_patient');
+    if (saved) {
+      try {
+        setPatient(JSON.parse(saved));
+      } catch (e) {
+        localStorage.removeItem('nurse_maya_patient');
+      }
+    }
+  }, []);
+
+  const handlePatientLogin = (p: Patient) => {
+    setPatient(p);
+    localStorage.setItem('nurse_maya_patient', JSON.stringify(p));
+  };
+
+  const handleLogout = () => {
+    setPatient(null);
+    localStorage.removeItem('nurse_maya_patient');
+  };
 
   const addActionLog = useCallback((message: string, type: 'tool' | 'info' | 'error' = 'info') => {
     const newLog: LogType = { id: Math.random().toString(36).substr(2, 9), timestamp: new Date(), message, type };
@@ -368,11 +372,12 @@ const App: React.FC = () => {
   const upcoming = appointments.filter(a => new Date(a.appointment_time) >= now && a.status === 'scheduled');
   const past = appointments.filter(a => new Date(a.appointment_time) < now || a.status !== 'scheduled');
 
-  if (!patient) return <div className="h-screen bg-slate-50 flex items-center justify-center p-6"><PatientSetup onComplete={setPatient} /></div>;
+  if (!patient) return <div className="h-screen bg-slate-50 flex items-center justify-center p-6"><PatientSetup onComplete={handlePatientLogin} /></div>;
 
   return (
     <div className="h-screen bg-[#FDFDFE] flex flex-col overflow-hidden text-slate-900">
-      <header className="px-6 py-3 border-b border-slate-100 flex items-center justify-between bg-white shrink-0 z-40">
+      {/* Sticky header ensuring visibility on mobile */}
+      <header className="sticky top-0 px-6 py-3 border-b border-slate-100 flex items-center justify-between bg-white shrink-0 z-50">
         <div className="flex items-center space-x-3">
           <div>
             <h1 className="text-base font-black leading-tight">Nurse Maya</h1>
@@ -384,8 +389,8 @@ const App: React.FC = () => {
             <p className="text-xs font-black">{patient.name}</p>
             <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">{patient.phone}</p>
           </div>
-          <button onClick={() => setPatient(null)} className="p-2 rounded-xl bg-slate-50 text-slate-400 hover:text-rose-500 transition-all">
-            <LogOut className="w-3.5 h-3.5" />
+          <button onClick={handleLogout} className="p-2 rounded-xl bg-slate-50 text-slate-400 hover:text-rose-500 transition-all">
+            <LogOut className="w-4 h-4" />
           </button>
         </div>
       </header>
@@ -395,21 +400,17 @@ const App: React.FC = () => {
           
           <section className="relative">
             {!isMayaActive ? (
-              <div className="bg-white rounded-2xl p-6 border border-slate-100 shadow-lg flex flex-col md:flex-row items-center justify-between space-y-4 md:space-y-0 md:space-x-8 animate-in fade-in slide-in-from-bottom-4">
+              <div className="bg-white rounded-2xl p-6 border border-slate-100 shadow-lg flex flex-col md:flex-row items-center justify-between space-y-6 md:space-y-0 md:space-x-8 animate-in fade-in slide-in-from-bottom-4">
                 <div className="flex-1 space-y-3 order-2 md:order-1 text-center md:text-left">
-                  <div className="inline-flex items-center px-3 py-1 bg-indigo-50 text-indigo-600 rounded-full text-[9px] font-black uppercase tracking-widest">
-                    <Mic className="w-2.5 h-2.5 mr-1.5" /> Live Database Access
-                  </div>
-                  {/* Reduced description font size */}
-                  <p className="text-[15px] text-slate-500 font-medium leading-normal max-w-xl">
+                  {/* Tag removed as requested */}
+                  <p className="text-[14px] text-slate-500 font-medium leading-normal max-w-xl">
                     Talk to Receptionist Maya to browse OPD, doctors, labs; schedule appointments or lab tests, manage visits.
                   </p>
                 </div>
                 <div className="order-1 md:order-2 shrink-0">
-                  {/* Increased CTA font size */}
                   <button 
                     onClick={startMaya}
-                    className="flex items-center space-x-3 bg-slate-900 hover:bg-indigo-600 text-white px-8 py-4 rounded-xl font-black text-base transition-all shadow-xl group mx-auto md:mx-0"
+                    className="flex items-center space-x-3 bg-slate-900 hover:bg-indigo-600 text-white px-8 py-4 rounded-xl font-black text-[17px] transition-all shadow-xl group mx-auto md:mx-0"
                   >
                     <Mic className="w-5 h-5 group-hover:scale-110 transition-transform" />
                     <span>Talk to Maya</span>
@@ -447,11 +448,11 @@ const App: React.FC = () => {
                           {app.lab_id ? <FlaskConical className="w-6 h-6" /> : <User className="w-6 h-6" />}
                         </div>
                         <div className="min-w-0">
-                          {/* Elements font size increased by 1pt */}
-                          <h4 className="font-bold text-slate-900 text-base truncate leading-tight">
+                          {/* Font size reduced by 1pt: text-base -> text-[15px] */}
+                          <h4 className="font-bold text-slate-900 text-[15px] truncate leading-tight">
                             {app.doctors?.name || app.labs?.test_name || 'Medical Visit'}
                           </h4>
-                          <p className="text-xs font-black text-indigo-600 uppercase tracking-tight mt-1">
+                          <p className="text-[11px] font-black text-indigo-600 uppercase tracking-tight mt-1">
                             {formatFriendlyIST(app.appointment_time)}
                           </p>
                         </div>
@@ -478,8 +479,9 @@ const App: React.FC = () => {
                           {app.status === 'cancelled' ? <AlertCircle className="w-6 h-6" /> : <CheckCircle2 className="w-6 h-6" />}
                         </div>
                         <div className="min-w-0">
-                          <h4 className="font-bold text-slate-600 text-base truncate leading-tight">{app.doctors?.name || app.labs?.test_name}</h4>
-                          <p className="text-xs font-black text-slate-400 uppercase tracking-tighter mt-1">
+                          {/* Font size reduced by 1pt: text-base -> text-[15px] */}
+                          <h4 className="font-bold text-slate-600 text-[15px] truncate leading-tight">{app.doctors?.name || app.labs?.test_name}</h4>
+                          <p className="text-[11px] font-black text-slate-400 uppercase tracking-tighter mt-1">
                             {app.status.toUpperCase()} • {formatFriendlyIST(app.appointment_time)}
                           </p>
                         </div>
@@ -503,7 +505,6 @@ const App: React.FC = () => {
                   <div key={summary.call_id} className="bg-white border border-slate-100 p-5 rounded-xl space-y-3 hover:shadow-lg transition-all border-b-2 hover:border-indigo-200 relative">
                     <div className="flex items-center justify-between">
                       <div className="p-2 bg-indigo-50 rounded-lg text-indigo-600"><MessageSquare className="w-3.5 h-3.5" /></div>
-                      {/* Formatted Date/Time on top right */}
                       <p className="text-[10px] font-black text-slate-400 uppercase tracking-tighter">
                         {formatFriendlyIST(summary.start_time)}
                       </p>
