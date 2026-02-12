@@ -1,5 +1,5 @@
 {
-  "name": "Nurse Maya AI: Hospital Assistant",
+  "name": "Maya Voice AI: Hospital Receptionist",
   "description": "A high-performance voice-enabled health assistant for booking hospital appointments and managing patient records.",
   "requestFramePermissions": [
     "microphone"

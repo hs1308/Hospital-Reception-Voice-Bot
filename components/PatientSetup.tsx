@@ -1,4 +1,3 @@
-
 import React, { useState } from 'react';
 import { supabase, isSupabaseConfigured } from '../supabaseClient';
 import { Patient } from '../types';
@@ -18,7 +17,7 @@ const PatientSetup: React.FC<PatientSetupProps> = ({ onComplete }) => {
     if (!phone) return;
     
     if (!isSupabaseConfigured()) {
-      setError("Database keys are missing. Please add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to your environment variables.");
+      setError("Database keys are missing. Please check your environment variables.");
       return;
     }
 
@@ -50,13 +49,9 @@ const PatientSetup: React.FC<PatientSetupProps> = ({ onComplete }) => {
     <div className="w-full font-sans selection:bg-indigo-100 selection:text-indigo-900 bg-white">
       <div className="max-w-5xl w-full flex flex-col items-center mx-auto">
         
-        {/* Main Content Area */}
         <div className="w-full flex flex-col items-center py-6 sm:py-10 px-4 relative">
-          
-          {/* Top Bar Accent */}
           <div className="absolute top-0 left-0 w-full h-1 bg-indigo-600 opacity-20" />
           
-          {/* Header Section - Increased space between name and subtitle */}
           <div className="flex flex-col items-center text-center mb-6">
             <h1 className="text-6xl font-[900] text-slate-900 tracking-tighter mb-0">
               Maya
@@ -66,7 +61,6 @@ const PatientSetup: React.FC<PatientSetupProps> = ({ onComplete }) => {
             </p>
           </div>
 
-          {/* Input Section - Reduced bottom padding for the CTA button */}
           <div className="w-full max-w-md bg-slate-50/70 pt-8 px-8 pb-6 rounded-[2rem] border border-slate-100 mb-8">
             <form onSubmit={handleStart} className="flex flex-col items-center">
               <div className="w-full space-y-3 mb-6">
@@ -78,7 +72,7 @@ const PatientSetup: React.FC<PatientSetupProps> = ({ onComplete }) => {
                   <input
                     type="tel"
                     required
-                    placeholder="Enter number to test"
+                    placeholder="Enter num to test, no OTP needed"
                     className="w-full pl-12 pr-4 py-4 rounded-2xl bg-white text-slate-900 border border-slate-200 focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/10 transition-all outline-none text-base font-medium shadow-sm"
                     value={phone}
                     onChange={(e) => setPhone(e.target.value)}
@@ -87,13 +81,13 @@ const PatientSetup: React.FC<PatientSetupProps> = ({ onComplete }) => {
                 <div className="flex items-start mt-4 px-1">
                   <Database className="w-3.5 h-3.5 text-slate-400 mt-1 mr-2 shrink-0" />
                   <p className="text-[13px] text-slate-500 leading-relaxed">
-                    Use <span className="font-bold text-slate-900 bg-slate-200 px-1.5 py-0.5 rounded">123456</span> for a dummy profile.
+                    Use 123456 for a dummy profile.
                   </p>
                 </div>
               </div>
 
               {error && (
-                <div className="w-full p-4 mb-6 bg-rose-50 border border-rose-100 rounded-2xl flex items-start space-x-3 animate-in fade-in slide-in-from-top-2">
+                <div className="w-full p-4 mb-6 bg-rose-50 border border-rose-100 rounded-2xl flex items-start space-x-3">
                   <AlertCircle className="w-5 h-5 text-rose-500 shrink-0 mt-0.5" />
                   <p className="text-rose-600 text-xs font-bold leading-relaxed">{error}</p>
                 </div>
@@ -114,7 +108,6 @@ const PatientSetup: React.FC<PatientSetupProps> = ({ onComplete }) => {
             </form>
           </div>
 
-          {/* Project Description Section - Removed Technology Preview badge */}
           <div className="w-full max-w-3xl text-center space-y-6 mb-12">
             <h2 className="text-3xl font-black text-slate-900 leading-tight">
               Replacing Hospital IVR with Intelligent Voice
@@ -124,9 +117,7 @@ const PatientSetup: React.FC<PatientSetupProps> = ({ onComplete }) => {
             </p>
           </div>
 
-          {/* Comparison Grid */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-8 w-full px-4 sm:px-0">
-            {/* What Maya can do */}
             <div className="bg-indigo-50/30 border border-indigo-100 rounded-[2rem] p-8 sm:p-10 flex flex-col group hover:bg-white hover:shadow-2xl hover:shadow-indigo-50 transition-all duration-500">
               <div className="flex items-center space-x-4 mb-8">
                 <div className="p-3 bg-indigo-500 rounded-2xl text-white shadow-lg shadow-indigo-100">
@@ -150,7 +141,6 @@ const PatientSetup: React.FC<PatientSetupProps> = ({ onComplete }) => {
               </ul>
             </div>
 
-            {/* What Maya can't do */}
             <div className="bg-slate-50 border border-slate-100 rounded-[2rem] p-8 sm:p-10 flex flex-col group hover:bg-white hover:shadow-2xl hover:shadow-slate-50 transition-all duration-500">
               <div className="flex items-center space-x-4 mb-8">
                 <div className="p-3 bg-slate-400 rounded-2xl text-white shadow-lg shadow-slate-50">
@@ -174,10 +164,8 @@ const PatientSetup: React.FC<PatientSetupProps> = ({ onComplete }) => {
               </ul>
             </div>
           </div>
-
         </div>
 
-        {/* Global Footer */}
         <div className="mt-8 py-6 text-center">
           <p className="text-[11px] font-black text-slate-400 uppercase tracking-[0.2em] flex items-center justify-center">
             <HeartPulse className="w-4 h-4 mr-2 text-rose-500" />
