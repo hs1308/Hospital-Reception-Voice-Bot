@@ -56,7 +56,7 @@ const PatientSetup: React.FC<PatientSetupProps> = ({ onComplete }) => {
             <h1 className="text-6xl font-[900] text-slate-900 tracking-tighter mb-0">
               Maya
             </h1>
-            <p className="text-[13px] font-black text-indigo-600 tracking-wide mt-2">
+            <p className="text-[16px] font-medium text-slate-500 mt-2">
               AI Hospital Receptionist
             </p>
           </div>
@@ -64,7 +64,7 @@ const PatientSetup: React.FC<PatientSetupProps> = ({ onComplete }) => {
           <div className="w-full max-w-md bg-slate-50/70 pt-8 px-8 pb-6 rounded-[2rem] border border-slate-100 mb-8">
             <form onSubmit={handleStart} className="flex flex-col items-center">
               <div className="w-full space-y-3 mb-6">
-                <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Mobile Number</label>
+                <label className="block text-[16px] font-medium text-slate-500 ml-1">Mobile Number</label>
                 <div className="relative group">
                   <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
                     <Phone className="h-5 w-5 text-slate-300 group-focus-within:text-indigo-500 transition-colors" />
@@ -96,11 +96,11 @@ const PatientSetup: React.FC<PatientSetupProps> = ({ onComplete }) => {
               <button
                 type="submit"
                 disabled={loading || phone.length < 5}
-                className="w-full bg-slate-900 hover:bg-indigo-600 text-white font-black py-4 px-8 rounded-2xl shadow-xl hover:shadow-indigo-100 transition-all flex items-center justify-center space-x-3 disabled:bg-slate-200 disabled:text-slate-400 disabled:shadow-none disabled:cursor-not-allowed group active:scale-95"
+                className="w-full bg-slate-900 hover:bg-indigo-600 text-white font-medium py-4 px-8 rounded-2xl shadow-xl hover:shadow-indigo-100 transition-all flex items-center justify-center space-x-3 disabled:bg-slate-200 disabled:text-slate-400 disabled:shadow-none disabled:cursor-not-allowed group active:scale-95"
               >
                 {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : (
                   <>
-                    <span className="text-sm tracking-wide">Go to Dashboard</span>
+                    <span className="text-base">Go to Dashboard</span>
                     <ArrowRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />
                   </>
                 )}
@@ -133,7 +133,7 @@ const PatientSetup: React.FC<PatientSetupProps> = ({ onComplete }) => {
                   "Department Schedules & OPD Info",
                   "Emergency Triage & Redirection"
                 ].map((item, i) => (
-                  <li key={i} className="flex items-start text-sm text-slate-600 font-medium">
+                  <li key={i} className="flex items-start text-base text-slate-600 font-medium">
                     <div className="w-1.5 h-1.5 rounded-full bg-indigo-400 mt-2 mr-3 shrink-0" />
                     <span>{item}</span>
                   </li>
@@ -156,7 +156,7 @@ const PatientSetup: React.FC<PatientSetupProps> = ({ onComplete }) => {
                   "No Emergency Ambulance Dispatch",
                   "No Insurance Consulting"
                 ].map((item, i) => (
-                  <li key={i} className="flex items-start text-sm text-slate-500 font-medium opacity-80">
+                  <li key={i} className="flex items-start text-base text-slate-500 font-medium opacity-80">
                     <div className="w-1.5 h-1.5 rounded-full bg-slate-300 mt-2 mr-3 shrink-0" />
                     <span>{item}</span>
                   </li>
@@ -167,7 +167,7 @@ const PatientSetup: React.FC<PatientSetupProps> = ({ onComplete }) => {
         </div>
 
         <div className="mt-8 py-6 text-center">
-          <p className="text-[11px] font-black text-slate-400 uppercase tracking-[0.2em] flex items-center justify-center">
+          <p className="text-[16px] font-medium text-slate-500 flex items-center justify-center">
             <HeartPulse className="w-4 h-4 mr-2 text-rose-500" />
             Designed for Modern Healthcare Excellence
           </p>

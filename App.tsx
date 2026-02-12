@@ -12,7 +12,8 @@ import {
   Mic, HeartPulse, 
   ChevronRight, AlertCircle, CheckCircle2,
   Activity, WifiOff, MessageSquare,
-  History, Timer, FlaskConical
+  History, Timer, FlaskConical,
+  ChevronLeft
 } from 'lucide-react';
 
 function encode(bytes: Uint8Array) {
@@ -40,7 +41,6 @@ async function decodeAudioData(data: Uint8Array, ctx: AudioContext, sampleRate: 
   return buffer;
 }
 
-// Simple linear resampler for input audio (Critical for iOS/Safari where sampleRate might be locked to 44.1k/48k)
 function resample(input: Float32Array, fromRate: number, toRate: number): Float32Array {
   if (fromRate === toRate) return input;
   const ratio = fromRate / toRate;
@@ -72,6 +72,8 @@ const formatFriendlyIST = (dateStr: string | undefined) => {
   }).format(date).replace(' at ', ', ');
 };
 
+const ITEMS_PER_PAGE = 4;
+
 const App: React.FC = () => {
   const [patient, setPatient] = useState<Patient | null>(null);
   const [appointments, setAppointments] = useState<Appointment[]>([]);
@@ -79,6 +81,10 @@ const App: React.FC = () => {
   const [botState, setBotState] = useState<BotState>('idle');
   const [actionLogs, setActionLogs] = useState<LogType[]>([]);
   const [isMayaActive, setIsMayaActive] = useState(false);
+  
+  // Pagination State
+  const [upcomingPage, setUpcomingPage] = useState(1);
+  const [pastPage, setPastPage] = useState(1);
 
   const inputAudioContextRef = useRef<AudioContext | null>(null);
   const outputAudioContextRef = useRef<AudioContext | null>(null);
@@ -254,7 +260,6 @@ const App: React.FC = () => {
       const inCtx = new AudioContextClass({ sampleRate: 16000 });
       const outCtx = new AudioContextClass({ sampleRate: 24000 });
       
-      // Explicitly resume for iOS Safari
       await inCtx.resume();
       await outCtx.resume();
       
@@ -275,7 +280,6 @@ const App: React.FC = () => {
             
             scriptProcessor.onaudioprocess = (e) => {
               const rawInput = e.inputBuffer.getChannelData(0);
-              // Ensure we are sending exactly 16000Hz PCM
               const resampledData = resample(rawInput, inCtx.sampleRate, 16000);
               const int16 = new Int16Array(resampledData.length);
               for (let i = 0; i < resampledData.length; i++) int16[i] = resampledData[i] * 32768;
@@ -360,6 +364,13 @@ const App: React.FC = () => {
   const upcoming = appointments.filter(a => new Date(a.appointment_time) >= now && a.status === 'scheduled');
   const past = appointments.filter(a => new Date(a.appointment_time) < now || a.status !== 'scheduled');
 
+  // Pagination Logic
+  const paginatedUpcoming = upcoming.slice((upcomingPage - 1) * ITEMS_PER_PAGE, upcomingPage * ITEMS_PER_PAGE);
+  const totalUpcomingPages = Math.max(1, Math.ceil(upcoming.length / ITEMS_PER_PAGE));
+
+  const paginatedPast = past.slice((pastPage - 1) * ITEMS_PER_PAGE, pastPage * ITEMS_PER_PAGE);
+  const totalPastPages = Math.max(1, Math.ceil(past.length / ITEMS_PER_PAGE));
+
   if (!patient) return <div className="min-h-screen bg-white flex items-start justify-center"><PatientSetup onComplete={handlePatientLogin} /></div>;
 
   return (
@@ -409,8 +420,8 @@ const App: React.FC = () => {
             <section className="space-y-4">
               <h3 className="text-lg font-black flex items-center px-1"><Calendar className="w-5 h-5 mr-2.5 text-indigo-600" /> Upcoming</h3>
               <div className="space-y-3">
-                {upcoming.length === 0 ? <div className="bg-slate-50/50 border border-dashed border-slate-200 rounded-2xl p-8 text-center text-slate-400 text-sm font-bold">No upcoming visits.</div> : 
-                upcoming.map(app => (
+                {paginatedUpcoming.length === 0 ? <div className="bg-slate-50/50 border border-dashed border-slate-200 rounded-2xl p-8 text-center text-slate-400 text-sm font-bold">No upcoming visits.</div> : 
+                paginatedUpcoming.map(app => (
                   <div key={app.id} className="bg-white border border-slate-100 p-4 rounded-xl flex items-center justify-between hover:shadow-md transition-all group">
                     <div className="flex items-center space-x-4 min-w-0">
                       <div className="w-11 h-11 rounded-lg bg-indigo-50 flex items-center justify-center text-indigo-600 shrink-0">{app.lab_id ? <FlaskConical className="w-6 h-6" /> : <User className="w-6 h-6" />}</div>
@@ -421,13 +432,34 @@ const App: React.FC = () => {
                     </div>
                   </div>
                 ))}
+
+                {totalUpcomingPages > 1 && (
+                  <div className="flex items-center justify-between pt-4 border-t border-slate-50 mt-2">
+                    <button 
+                      onClick={() => setUpcomingPage(p => Math.max(1, p - 1))}
+                      disabled={upcomingPage === 1}
+                      className="p-1.5 rounded-lg bg-white border border-slate-100 text-slate-400 disabled:opacity-30 transition-all hover:bg-slate-50"
+                    >
+                      <ChevronLeft className="w-4 h-4" />
+                    </button>
+                    <span className="text-[10px] font-black uppercase tracking-tighter text-slate-400">Page {upcomingPage} of {totalUpcomingPages}</span>
+                    <button 
+                      onClick={() => setUpcomingPage(p => Math.min(totalUpcomingPages, p + 1))}
+                      disabled={upcomingPage === totalUpcomingPages}
+                      className="p-1.5 rounded-lg bg-white border border-slate-100 text-slate-400 disabled:opacity-30 transition-all hover:bg-slate-50"
+                    >
+                      <ChevronRight className="w-4 h-4" />
+                    </button>
+                  </div>
+                )}
               </div>
             </section>
+            
             <section className="space-y-4">
               <h3 className="text-lg font-black text-slate-400 flex items-center px-1"><History className="w-5 h-5 mr-2.5" /> Past Records</h3>
               <div className="space-y-3">
-                {past.length === 0 ? <div className="bg-slate-50/50 border border-dashed border-slate-200 rounded-2xl p-8 text-center text-slate-400 text-sm font-bold opacity-50">No history found.</div> : 
-                past.map(app => (
+                {paginatedPast.length === 0 ? <div className="bg-slate-50/50 border border-dashed border-slate-200 rounded-2xl p-8 text-center text-slate-400 text-sm font-bold opacity-50">No history found.</div> : 
+                paginatedPast.map(app => (
                   <div key={app.id} className="bg-white/50 border border-slate-100 p-4 rounded-xl flex items-center justify-between opacity-75">
                     <div className="flex items-center space-x-4 min-w-0">
                       <div className="w-11 h-11 rounded-lg bg-slate-50 flex items-center justify-center text-slate-400 shrink-0">{app.status === 'cancelled' ? <AlertCircle className="w-6 h-6" /> : <CheckCircle2 className="w-6 h-6" />}</div>
@@ -438,6 +470,26 @@ const App: React.FC = () => {
                     </div>
                   </div>
                 ))}
+
+                {totalPastPages > 1 && (
+                  <div className="flex items-center justify-between pt-4 border-t border-slate-50 mt-2">
+                    <button 
+                      onClick={() => setPastPage(p => Math.max(1, p - 1))}
+                      disabled={pastPage === 1}
+                      className="p-1.5 rounded-lg bg-white border border-slate-100 text-slate-400 disabled:opacity-30 transition-all hover:bg-slate-50"
+                    >
+                      <ChevronLeft className="w-4 h-4" />
+                    </button>
+                    <span className="text-[10px] font-black uppercase tracking-tighter text-slate-400">Page {pastPage} of {totalPastPages}</span>
+                    <button 
+                      onClick={() => setPastPage(p => Math.min(totalPastPages, p + 1))}
+                      disabled={pastPage === totalPastPages}
+                      className="p-1.5 rounded-lg bg-white border border-slate-100 text-slate-400 disabled:opacity-30 transition-all hover:bg-slate-50"
+                    >
+                      <ChevronRight className="w-4 h-4" />
+                    </button>
+                  </div>
+                )}
               </div>
             </section>
           </div>
