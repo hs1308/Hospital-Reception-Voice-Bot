@@ -1,6 +1,7 @@
 export const DB_TABLES = {
   patients: 'maya_patients',
   doctors: 'maya_doctors',
+  doctorSlots: 'maya_doctor_slots',
   labs: 'maya_labs',
   opdTimings: 'maya_opd_timings',
   doctorAppointments: 'maya_doctor_appointments',

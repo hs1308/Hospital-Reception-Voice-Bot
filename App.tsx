@@ -99,6 +99,23 @@ const normalizeAppointmentRecord = (appointment: any, type: 'doctor' | 'lab') =>
   lab_test_name: appointment.labs?.test_name ?? null,
 });
 
+const normalizeDoctorSlotRecord = (slot: any) => ({
+  id: slot.id,
+  doctor_id: slot.doctor_id,
+  start_time: slot.start_time,
+  is_available: slot.is_available,
+  booked_by_phone: slot.booked_by_phone ?? null,
+  appointment_id: slot.appointment_id ?? null,
+  doctor_name: slot.doctor?.name ?? null,
+  doctor_specialty: slot.doctor?.specialty ?? null,
+});
+
+const clearDoctorSlotBookingFields = {
+  is_available: true,
+  booked_by_phone: null,
+  appointment_id: null,
+};
+
 const App: React.FC = () => {
   const [patient, setPatient] = useState<Patient | null>(null);
   const [appointments, setAppointments] = useState<Appointment[]>([]);
@@ -330,6 +347,27 @@ const App: React.FC = () => {
         result = error
           ? createToolError('DOCTORS_FETCH_FAILED', error.message)
           : createToolSuccess(data ?? []);
+      } else if (fc.name === 'get_doctor_slots') {
+        if (!fc.args?.doctor_id) {
+          result = createToolError('DOCTOR_ID_REQUIRED', 'A doctor_id is required to check doctor slots.');
+        } else {
+          const startDate =
+            typeof fc.args.start_date === 'string' && fc.args.start_date.trim().length > 0
+              ? new Date(fc.args.start_date).toISOString()
+              : new Date().toISOString();
+
+          const { data, error } = await supabase
+            .from(DB_TABLES.doctorSlots)
+            .select(`*, doctor:${DB_TABLES.doctors}(id, name, specialty)`)
+            .eq('doctor_id', fc.args.doctor_id)
+            .eq('is_available', true)
+            .gte('start_time', startDate)
+            .order('start_time', { ascending: true });
+
+          result = error
+            ? createToolError('DOCTOR_SLOTS_FETCH_FAILED', error.message)
+            : createToolSuccess((data ?? []).map(normalizeDoctorSlotRecord));
+        }
       } else if (fc.name === 'get_labs') {
         const { data, error } = await supabase.from(DB_TABLES.labs).select('*');
         result = error
@@ -373,23 +411,110 @@ const App: React.FC = () => {
           });
         }
       } else if (fc.name === 'book_doctor_appointment') {
-        const newAppt = {
-          patient_phone: patient.phone,
-          doctor_id: fc.args.doctor_id,
-          appointment_time: fc.args.appointment_time,
-          status: 'scheduled',
-        };
-        const { data, error } = await supabase
-          .from(DB_TABLES.doctorAppointments)
-          .insert([newAppt])
-          .select(`*, ${DB_TABLES.doctors}(*)`)
-          .single();
+        if (!fc.args?.doctor_id) {
+          result = createToolError('DOCTOR_ID_REQUIRED', 'A valid doctor_id is required to book a doctor appointment.');
+        }
+        else {
+          const requestedTime =
+            typeof fc.args.appointment_time === 'string' && fc.args.appointment_time.trim().length > 0
+              ? new Date(fc.args.appointment_time).toISOString()
+              : null;
 
-        if (error || !data) {
-          result = createToolError('DOCTOR_BOOK_FAILED', error?.message || 'Unable to book doctor appointment.');
-        } else {
-          setAppointments((prev) => [data as any, ...prev]);
-          result = createToolSuccess(normalizeAppointmentRecord(data, 'doctor'), 'Doctor appointment booked successfully.');
+          let slotQuery = supabase
+            .from(DB_TABLES.doctorSlots)
+            .select('*')
+            .eq('doctor_id', fc.args.doctor_id)
+            .eq('is_available', true);
+
+          if (fc.args.slot_id) {
+            slotQuery = slotQuery.eq('id', fc.args.slot_id);
+          } else if (requestedTime) {
+            slotQuery = slotQuery.eq('start_time', requestedTime);
+          } else {
+            result = createToolError(
+              'DOCTOR_SLOT_REQUIRED',
+              'A real doctor slot is required before booking. Please check doctor slots first.',
+            );
+            const durationMs = Date.now() - startedAt;
+            await logToDebug('TOOL_CALL_FAILED', {
+              tool_name: fc.name,
+              duration_ms: durationMs,
+              args: fc.args ?? {},
+              result,
+            });
+            addActionLog(`${fc.name} failed: ${result.error.message}`, 'error');
+            return result;
+          }
+
+          const { data: slot, error: slotError } = await slotQuery.single();
+
+          if (slotError || !slot) {
+            result = createToolError(
+              'DOCTOR_SLOT_NOT_AVAILABLE',
+              'The requested doctor slot is not available. Please choose one of the real available slots.',
+            );
+          } else if (slot.doctor_id !== fc.args.doctor_id) {
+            result = createToolError(
+              'DOCTOR_SLOT_MISMATCH',
+              'The requested slot does not belong to the selected doctor.',
+            );
+          } else {
+            const appointmentTime = slot.start_time;
+            const newAppt = {
+              patient_phone: patient.phone,
+              doctor_id: fc.args.doctor_id,
+              appointment_time: appointmentTime,
+              status: 'scheduled',
+            };
+
+            const { data: appointment, error: appointmentError } = await supabase
+              .from(DB_TABLES.doctorAppointments)
+              .insert([newAppt])
+              .select(`*, ${DB_TABLES.doctors}(*)`)
+              .single();
+
+            if (appointmentError || !appointment) {
+              result = createToolError(
+                'DOCTOR_BOOK_FAILED',
+                appointmentError?.message || 'Unable to book doctor appointment.',
+              );
+            } else {
+              const { error: slotUpdateError } = await supabase
+                .from(DB_TABLES.doctorSlots)
+                .update({
+                  is_available: false,
+                  booked_by_phone: patient.phone,
+                  appointment_id: appointment.id,
+                })
+                .eq('id', slot.id)
+                .eq('is_available', true);
+
+              if (slotUpdateError) {
+                result = createToolError(
+                  'DOCTOR_SLOT_UPDATE_FAILED',
+                  `Appointment was created but the slot could not be marked booked: ${slotUpdateError.message}`,
+                  {
+                    appointment: normalizeAppointmentRecord(appointment, 'doctor'),
+                    slot: normalizeDoctorSlotRecord(slot),
+                  },
+                );
+              } else {
+                setAppointments((prev) => [appointment as any, ...prev]);
+                result = createToolSuccess(
+                  {
+                    appointment: normalizeAppointmentRecord(appointment, 'doctor'),
+                    slot: normalizeDoctorSlotRecord({
+                      ...slot,
+                      is_available: false,
+                      booked_by_phone: patient.phone,
+                      appointment_id: appointment.id,
+                    }),
+                  },
+                  'Doctor appointment booked successfully.',
+                );
+              }
+            }
+          }
         }
       } else if (fc.name === 'book_lab_appointment') {
         const newAppt = {
@@ -422,8 +547,21 @@ const App: React.FC = () => {
         if (error || !data) {
           result = createToolError('DOCTOR_CANCEL_FAILED', error?.message || 'Unable to cancel doctor appointment.');
         } else {
-          await fetchData(patient.phone);
-          result = createToolSuccess(normalizeAppointmentRecord(data, 'doctor'), 'Doctor appointment cancelled successfully.');
+          const { error: slotReleaseError } = await supabase
+            .from(DB_TABLES.doctorSlots)
+            .update(clearDoctorSlotBookingFields)
+            .eq('appointment_id', data.id);
+
+          if (slotReleaseError) {
+            result = createToolError(
+              'DOCTOR_SLOT_RELEASE_FAILED',
+              `Appointment was cancelled but the slot could not be released: ${slotReleaseError.message}`,
+              { appointment: normalizeAppointmentRecord(data, 'doctor') },
+            );
+          } else {
+            await fetchData(patient.phone);
+            result = createToolSuccess(normalizeAppointmentRecord(data, 'doctor'), 'Doctor appointment cancelled successfully.');
+          }
         }
       } else if (fc.name === 'cancel_lab_appointment') {
         const { data, error } = await supabase
@@ -441,19 +579,121 @@ const App: React.FC = () => {
           result = createToolSuccess(normalizeAppointmentRecord(data, 'lab'), 'Lab appointment cancelled successfully.');
         }
       } else if (fc.name === 'reschedule_doctor_appointment') {
-        const { data, error } = await supabase
+        const { data: currentAppointment, error: currentAppointmentError } = await supabase
           .from(DB_TABLES.doctorAppointments)
-          .update({ appointment_time: fc.args.new_time, status: 'scheduled' })
+          .select(`*, ${DB_TABLES.doctors}(*)`)
           .eq('id', fc.args.appointment_id)
           .eq('patient_phone', patient.phone)
-          .select(`*, ${DB_TABLES.doctors}(*)`)
           .single();
 
-        if (error || !data) {
-          result = createToolError('DOCTOR_RESCHEDULE_FAILED', error?.message || 'Unable to reschedule doctor appointment.');
+        if (currentAppointmentError || !currentAppointment) {
+          result = createToolError(
+            'DOCTOR_APPOINTMENT_NOT_FOUND',
+            currentAppointmentError?.message || 'Unable to find doctor appointment to reschedule.',
+          );
         } else {
-          await fetchData(patient.phone);
-          result = createToolSuccess(normalizeAppointmentRecord(data, 'doctor'), 'Doctor appointment rescheduled successfully.');
+          const requestedTime =
+            typeof fc.args.new_time === 'string' && fc.args.new_time.trim().length > 0
+              ? new Date(fc.args.new_time).toISOString()
+              : null;
+
+          let slotQuery = supabase
+            .from(DB_TABLES.doctorSlots)
+            .select('*')
+            .eq('doctor_id', currentAppointment.doctor_id)
+            .eq('is_available', true);
+
+          if (fc.args.slot_id) {
+            slotQuery = slotQuery.eq('id', fc.args.slot_id);
+          } else if (requestedTime) {
+            slotQuery = slotQuery.eq('start_time', requestedTime);
+          } else {
+            result = createToolError(
+              'DOCTOR_SLOT_REQUIRED',
+              'A real available slot is required before rescheduling. Please check doctor slots first.',
+            );
+            const durationMs = Date.now() - startedAt;
+            await logToDebug('TOOL_CALL_FAILED', {
+              tool_name: fc.name,
+              duration_ms: durationMs,
+              args: fc.args ?? {},
+              result,
+            });
+            addActionLog(`${fc.name} failed: ${result.error.message}`, 'error');
+            return result;
+          }
+
+          const { data: newSlot, error: newSlotError } = await slotQuery.single();
+
+          if (newSlotError || !newSlot) {
+            result = createToolError(
+              'DOCTOR_SLOT_NOT_AVAILABLE',
+              'The requested new doctor slot is not available. Please choose one of the real available slots.',
+            );
+          } else {
+            const { data: updatedAppointment, error: updateAppointmentError } = await supabase
+              .from(DB_TABLES.doctorAppointments)
+              .update({ appointment_time: newSlot.start_time, status: 'scheduled' })
+              .eq('id', fc.args.appointment_id)
+              .eq('patient_phone', patient.phone)
+              .select(`*, ${DB_TABLES.doctors}(*)`)
+              .single();
+
+            if (updateAppointmentError || !updatedAppointment) {
+              result = createToolError(
+                'DOCTOR_RESCHEDULE_FAILED',
+                updateAppointmentError?.message || 'Unable to reschedule doctor appointment.',
+              );
+            } else {
+              const { error: releaseOldSlotError } = await supabase
+                .from(DB_TABLES.doctorSlots)
+                .update(clearDoctorSlotBookingFields)
+                .eq('appointment_id', currentAppointment.id);
+
+              if (releaseOldSlotError) {
+                result = createToolError(
+                  'DOCTOR_OLD_SLOT_RELEASE_FAILED',
+                  `Appointment was moved but the old slot could not be released: ${releaseOldSlotError.message}`,
+                  { appointment: normalizeAppointmentRecord(updatedAppointment, 'doctor') },
+                );
+              } else {
+                const { error: reserveNewSlotError } = await supabase
+                  .from(DB_TABLES.doctorSlots)
+                  .update({
+                    is_available: false,
+                    booked_by_phone: patient.phone,
+                    appointment_id: updatedAppointment.id,
+                  })
+                  .eq('id', newSlot.id)
+                  .eq('is_available', true);
+
+                if (reserveNewSlotError) {
+                  result = createToolError(
+                    'DOCTOR_NEW_SLOT_RESERVE_FAILED',
+                    `Appointment was moved but the new slot could not be reserved: ${reserveNewSlotError.message}`,
+                    {
+                      appointment: normalizeAppointmentRecord(updatedAppointment, 'doctor'),
+                      slot: normalizeDoctorSlotRecord(newSlot),
+                    },
+                  );
+                } else {
+                  await fetchData(patient.phone);
+                  result = createToolSuccess(
+                    {
+                      appointment: normalizeAppointmentRecord(updatedAppointment, 'doctor'),
+                      slot: normalizeDoctorSlotRecord({
+                        ...newSlot,
+                        is_available: false,
+                        booked_by_phone: patient.phone,
+                        appointment_id: updatedAppointment.id,
+                      }),
+                    },
+                    'Doctor appointment rescheduled successfully.',
+                  );
+                }
+              }
+            }
+          }
         }
       } else if (fc.name === 'reschedule_lab_appointment') {
         const { data, error } = await supabase

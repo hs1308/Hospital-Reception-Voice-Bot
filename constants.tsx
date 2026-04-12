@@ -10,6 +10,7 @@ export const SYSTEM_INSTRUCTION = `
 
 ## 2. CAPABILITIES & TOOLS
 - **Doctor Discovery:** Use 'get_doctors' to find specialists.
+- **Doctor Slot Availability:** Use 'get_doctor_slots' to find real bookable doctor slots.
 - **Lab Discovery:** Use 'get_labs' to list available tests and prices.
 - **OPD Info:** Use 'get_opd_timings' to find room numbers and schedules.
 - **Appointments:** 
@@ -33,6 +34,15 @@ export const SYSTEM_INSTRUCTION = `
 - **IMPORTANT:** All times and dates must be in Indian Standard Time (IST).
 - Always verify the doctor's name or test name before booking.
 - For any request about appointments, bookings, cancellations, or reschedules, you MUST use the relevant tool before answering.
+- Never use OPD timings as proof of a bookable appointment slot.
+- Before suggesting or booking a doctor appointment, you MUST check 'get_doctor_slots'.
+- For specialty requests:
+    - First check 'get_doctors' for matching specialists.
+    - If none exist, clearly say that specialty is unavailable and offer the specialties that are available.
+    - If matches exist, tell the user the matching doctors and ask for a preferred doctor or time.
+    - Then use 'get_doctor_slots' for the preferred doctor or preference.
+    - If the preferred option is unavailable, clearly say so and suggest real available doctor/slot alternatives from the tools.
+- For doctor cancellations or reschedules, make sure the slot becomes available again only after the appointment is cancelled or moved successfully.
 - Never invent appointment details, doctor availability, lab availability, or OPD timings.
 - Never claim a task succeeded unless the tool result says \`success: true\`.
 - If a tool returns an error or missing data, clearly tell the user you could not complete the request and briefly explain why.
@@ -47,6 +57,18 @@ export const TOOLS: FunctionDeclaration[] = [
     parameters: { type: Type.OBJECT, properties: {} }
   },
   {
+    name: 'get_doctor_slots',
+    description: 'Retrieves real bookable slots for a doctor from the doctor slots table.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        doctor_id: { type: Type.STRING, description: 'Doctor UUID from get_doctors.' },
+        start_date: { type: Type.STRING, description: 'Optional ISO date or datetime to filter slots from.' }
+      },
+      required: ['doctor_id']
+    }
+  },
+  {
     name: 'get_labs',
     description: 'Retrieves list of available lab tests and prices.',
     parameters: { type: Type.OBJECT, properties: {} }
@@ -58,14 +80,15 @@ export const TOOLS: FunctionDeclaration[] = [
   },
   {
     name: 'book_doctor_appointment',
-    description: 'Books a new appointment with a specific doctor.',
+    description: 'Books a new appointment with a specific doctor using a real slot from get_doctor_slots.',
     parameters: {
       type: Type.OBJECT,
       properties: {
-        doctor_id: { type: Type.STRING },
-        appointment_time: { type: Type.STRING, description: 'ISO string date' }
+        doctor_id: { type: Type.STRING, description: 'Doctor UUID from get_doctors.' },
+        slot_id: { type: Type.STRING, description: 'Slot UUID from get_doctor_slots.' },
+        appointment_time: { type: Type.STRING, description: 'Optional ISO string date. Use only if matching a real slot time.' }
       },
-      required: ['doctor_id', 'appointment_time']
+      required: ['doctor_id']
     }
   },
   {
@@ -87,7 +110,7 @@ export const TOOLS: FunctionDeclaration[] = [
   },
   {
     name: 'cancel_doctor_appointment',
-    description: 'Cancels an existing doctor appointment.',
+    description: 'Cancels an existing doctor appointment and makes that doctor slot available again.',
     parameters: {
       type: Type.OBJECT,
       properties: {
@@ -109,14 +132,15 @@ export const TOOLS: FunctionDeclaration[] = [
   },
   {
     name: 'reschedule_doctor_appointment',
-    description: 'Changes the time of an existing doctor appointment.',
+    description: 'Changes the time of an existing doctor appointment using a real available slot and frees the old slot.',
     parameters: {
       type: Type.OBJECT,
       properties: {
         appointment_id: { type: Type.STRING },
+        slot_id: { type: Type.STRING, description: 'Optional target slot UUID from get_doctor_slots.' },
         new_time: { type: Type.STRING, description: 'ISO string date' }
       },
-      required: ['appointment_id', 'new_time']
+      required: ['appointment_id']
     }
   },
   {
