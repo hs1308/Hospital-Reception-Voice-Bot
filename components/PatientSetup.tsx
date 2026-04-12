@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { supabase, isSupabaseConfigured } from '../supabaseClient';
 import { Patient } from '../types';
+import { DB_TABLES } from '../dbTables';
 import { Phone, ArrowRight, Loader2, AlertCircle, CheckCircle2, XCircle, Database, HeartPulse } from 'lucide-react';
 
 interface PatientSetupProps {
@@ -24,14 +25,14 @@ const PatientSetup: React.FC<PatientSetupProps> = ({ onComplete }) => {
     setLoading(true);
     setError('');
     try {
-      const { data, error: fetchError } = await supabase.from('patients').select('*').eq('phone', phone).maybeSingle();
+      const { data, error: fetchError } = await supabase.from(DB_TABLES.patients).select('*').eq('phone', phone).maybeSingle();
       if (fetchError) throw fetchError;
       
       if (data) {
         onComplete(data as Patient);
       } else {
         const { data: newData, error: insertError } = await supabase
-          .from('patients')
+          .from(DB_TABLES.patients)
           .insert([{ phone, name: 'Patient ' + phone.slice(-4) }])
           .select()
           .single();

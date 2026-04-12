@@ -3,6 +3,7 @@ import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
 import { supabase, isSupabaseConfigured } from './supabaseClient';
 import { Patient, Appointment, BotState, ActionLog as LogType, ChatSummary } from './types';
 import { SYSTEM_INSTRUCTION, TOOLS } from './constants';
+import { DB_TABLES } from './dbTables';
 import PatientSetup from './components/PatientSetup';
 import PulseOrb from './components/PulseOrb';
 import ActionLog from './components/ActionLog';
@@ -74,6 +75,30 @@ const formatFriendlyIST = (dateStr: string | undefined) => {
 
 const ITEMS_PER_PAGE = 4;
 
+type ToolResult =
+  | { success: true; data: any; message?: string }
+  | { success: false; error: { code: string; message: string }; data?: any };
+
+const createToolSuccess = (data: any, message?: string): ToolResult => ({ success: true, data, message });
+
+const createToolError = (code: string, message: string, data?: any): ToolResult => ({
+  success: false,
+  error: { code, message },
+  data,
+});
+
+const normalizeAppointmentRecord = (appointment: any, type: 'doctor' | 'lab') => ({
+  id: appointment.id,
+  type,
+  status: appointment.status,
+  appointment_time: appointment.appointment_time,
+  doctor_id: appointment.doctor_id ?? null,
+  lab_id: appointment.lab_id ?? null,
+  doctor_name: appointment.doctors?.name ?? null,
+  doctor_specialty: appointment.doctors?.specialty ?? null,
+  lab_test_name: appointment.labs?.test_name ?? null,
+});
+
 const App: React.FC = () => {
   const [patient, setPatient] = useState<Patient | null>(null);
   const [appointments, setAppointments] = useState<Appointment[]>([]);
@@ -93,6 +118,10 @@ const App: React.FC = () => {
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const transcriptRef = useRef<string[]>([]);
   const sessionStartTimeRef = useRef<number | null>(null);
+  const sessionIdRef = useRef<string | null>(null);
+  const lastUserTranscriptAtRef = useRef<number | null>(null);
+  const awaitingFirstResponseRef = useRef(false);
+  const lastTranscriptEventAtRef = useRef<number | null>(null);
 
   useEffect(() => {
     const saved = localStorage.getItem('nurse_maya_patient');
@@ -123,10 +152,13 @@ const App: React.FC = () => {
   const logToDebug = useCallback(async (event: string, metadata: any = {}) => {
     if (!isSupabaseConfigured() || !patient) return;
     try {
-      await supabase.from('maya_debug_logs').insert([{
+      await supabase.from(DB_TABLES.mayaDebugLogs).insert([{
         patient_phone: patient.phone,
         event,
-        metadata,
+        metadata: {
+          session_id: sessionIdRef.current,
+          ...metadata,
+        },
         timestamp: new Date().toISOString()
       }]);
     } catch (e) {
@@ -134,18 +166,51 @@ const App: React.FC = () => {
     }
   }, [patient]);
 
+  const recordToolLatency = useCallback((event: string, extra: any = {}) => {
+    if (!lastUserTranscriptAtRef.current) return;
+    const latencyMs = Date.now() - lastUserTranscriptAtRef.current;
+    logToDebug(event, { latency_ms: latencyMs, ...extra });
+  }, [logToDebug]);
+
+  const persistTranscriptTurn = useCallback(async (speaker: 'user' | 'maya', transcript: string) => {
+    if (!isSupabaseConfigured() || !patient || !sessionIdRef.current || !transcript.trim()) return;
+
+    const endedAt = new Date();
+    const startedAt = lastTranscriptEventAtRef.current
+      ? new Date(lastTranscriptEventAtRef.current)
+      : endedAt;
+
+    lastTranscriptEventAtRef.current = endedAt.getTime();
+
+    try {
+      await supabase.from(DB_TABLES.sessionTranscripts).insert([{
+        session_id: sessionIdRef.current,
+        speaker,
+        patient_phone: patient.phone,
+        patient_name: patient.name,
+        started_at: startedAt.toISOString(),
+        ended_at: endedAt.toISOString(),
+        language: navigator.language || 'unknown',
+        transcript: transcript.trim(),
+      }]);
+    } catch (error) {
+      console.warn('Transcript logging failed', error);
+      addActionLog('Transcript logging failed', 'error');
+    }
+  }, [patient, addActionLog]);
+
   const fetchData = useCallback(async (phone: string) => {
     if (!isSupabaseConfigured()) return;
     
     const { data: drData, error: drError } = await supabase
-      .from('doctor_appointments')
-      .select('*, doctors(*)')
+      .from(DB_TABLES.doctorAppointments)
+      .select(`*, ${DB_TABLES.doctors}(*)`)
       .eq('patient_phone', phone)
       .order('appointment_time', { ascending: false });
     
     const { data: labData } = await supabase
-      .from('lab_appointments')
-      .select('*, labs(*)')
+      .from(DB_TABLES.labAppointments)
+      .select(`*, ${DB_TABLES.labs}(*)`)
       .eq('patient_phone', phone)
       .order('appointment_time', { ascending: false });
 
@@ -159,7 +224,7 @@ const App: React.FC = () => {
     setAppointments(combined as any);
 
     const { data: summaryData } = await supabase
-      .from('user_call_summary')
+      .from(DB_TABLES.userCallSummary)
       .select('*')
       .eq('user_number', phone)
       .order('created_at', { ascending: false });
@@ -212,7 +277,7 @@ const App: React.FC = () => {
           tech_issue_detected: false
         };
 
-        const { data, error } = await supabase.from('user_call_summary').insert([newSummary]).select().single();
+        const { data, error } = await supabase.from(DB_TABLES.userCallSummary).insert([newSummary]).select().single();
         if (error) {
           addActionLog(`Summary DB Error: ${error.message}`, 'error');
           logToDebug('SUMMARY_SAVE_ERROR', { error_code: error.code, error_message: error.message, data: newSummary });
@@ -225,6 +290,10 @@ const App: React.FC = () => {
     }
 
     sessionStartTimeRef.current = null;
+    sessionIdRef.current = null;
+    lastUserTranscriptAtRef.current = null;
+    awaitingFirstResponseRef.current = false;
+    lastTranscriptEventAtRef.current = null;
     transcriptRef.current = [];
     if (sessionRef.current) try { await sessionRef.current.close(); } catch(e) {}
     sourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
@@ -244,6 +313,195 @@ const App: React.FC = () => {
     logToDebug('SESSION_ENDED');
   }, [patient, addActionLog, logToDebug]);
 
+  const executeToolCall = useCallback(async (fc: any): Promise<ToolResult> => {
+    if (!patient) {
+      return createToolError('PATIENT_MISSING', 'No patient is active for this session.');
+    }
+
+    const startedAt = Date.now();
+    await logToDebug('TOOL_CALL_RECEIVED', { tool_name: fc.name, args: fc.args ?? {} });
+    addActionLog(`Maya requested ${fc.name}`, 'tool');
+
+    try {
+      let result: ToolResult;
+
+      if (fc.name === 'get_doctors') {
+        const { data, error } = await supabase.from(DB_TABLES.doctors).select('*');
+        result = error
+          ? createToolError('DOCTORS_FETCH_FAILED', error.message)
+          : createToolSuccess(data ?? []);
+      } else if (fc.name === 'get_labs') {
+        const { data, error } = await supabase.from(DB_TABLES.labs).select('*');
+        result = error
+          ? createToolError('LABS_FETCH_FAILED', error.message)
+          : createToolSuccess(data ?? []);
+      } else if (fc.name === 'get_opd_timings') {
+        const { data, error } = await supabase.from(DB_TABLES.opdTimings).select('*');
+        result = error
+          ? createToolError('OPD_FETCH_FAILED', error.message)
+          : createToolSuccess(data ?? []);
+      } else if (fc.name === 'get_patient_appointments') {
+        const [{ data: drData, error: drError }, { data: labData, error: labError }] = await Promise.all([
+          supabase
+            .from(DB_TABLES.doctorAppointments)
+            .select(`*, ${DB_TABLES.doctors}(*)`)
+            .eq('patient_phone', patient.phone)
+            .order('appointment_time', { ascending: true }),
+          supabase
+            .from(DB_TABLES.labAppointments)
+            .select(`*, ${DB_TABLES.labs}(*)`)
+            .eq('patient_phone', patient.phone)
+            .order('appointment_time', { ascending: true }),
+        ]);
+
+        if (drError || labError) {
+          result = createToolError(
+            'APPOINTMENTS_FETCH_FAILED',
+            drError?.message || labError?.message || 'Could not fetch appointments.',
+          );
+        } else {
+          const combined = [
+            ...(drData ?? []).map((appointment) => normalizeAppointmentRecord(appointment, 'doctor')),
+            ...(labData ?? []).map((appointment) => normalizeAppointmentRecord(appointment, 'lab')),
+          ].sort((a, b) => new Date(a.appointment_time).getTime() - new Date(b.appointment_time).getTime());
+
+          const nowIso = new Date().toISOString();
+          result = createToolSuccess({
+            appointments: combined,
+            upcoming: combined.filter((appointment) => appointment.status === 'scheduled' && appointment.appointment_time >= nowIso),
+            past: combined.filter((appointment) => appointment.status !== 'scheduled' || appointment.appointment_time < nowIso),
+          });
+        }
+      } else if (fc.name === 'book_doctor_appointment') {
+        const newAppt = {
+          patient_phone: patient.phone,
+          doctor_id: fc.args.doctor_id,
+          appointment_time: fc.args.appointment_time,
+          status: 'scheduled',
+        };
+        const { data, error } = await supabase
+          .from(DB_TABLES.doctorAppointments)
+          .insert([newAppt])
+          .select(`*, ${DB_TABLES.doctors}(*)`)
+          .single();
+
+        if (error || !data) {
+          result = createToolError('DOCTOR_BOOK_FAILED', error?.message || 'Unable to book doctor appointment.');
+        } else {
+          setAppointments((prev) => [data as any, ...prev]);
+          result = createToolSuccess(normalizeAppointmentRecord(data, 'doctor'), 'Doctor appointment booked successfully.');
+        }
+      } else if (fc.name === 'book_lab_appointment') {
+        const newAppt = {
+          patient_phone: patient.phone,
+          lab_id: fc.args.lab_id,
+          appointment_time: fc.args.appointment_time,
+          status: 'scheduled',
+        };
+        const { data, error } = await supabase
+          .from(DB_TABLES.labAppointments)
+          .insert([newAppt])
+          .select(`*, ${DB_TABLES.labs}(*)`)
+          .single();
+
+        if (error || !data) {
+          result = createToolError('LAB_BOOK_FAILED', error?.message || 'Unable to book lab appointment.');
+        } else {
+          setAppointments((prev) => [data as any, ...prev]);
+          result = createToolSuccess(normalizeAppointmentRecord(data, 'lab'), 'Lab appointment booked successfully.');
+        }
+      } else if (fc.name === 'cancel_doctor_appointment') {
+        const { data, error } = await supabase
+          .from(DB_TABLES.doctorAppointments)
+          .update({ status: 'cancelled' })
+          .eq('id', fc.args.appointment_id)
+          .eq('patient_phone', patient.phone)
+          .select(`*, ${DB_TABLES.doctors}(*)`)
+          .single();
+
+        if (error || !data) {
+          result = createToolError('DOCTOR_CANCEL_FAILED', error?.message || 'Unable to cancel doctor appointment.');
+        } else {
+          await fetchData(patient.phone);
+          result = createToolSuccess(normalizeAppointmentRecord(data, 'doctor'), 'Doctor appointment cancelled successfully.');
+        }
+      } else if (fc.name === 'cancel_lab_appointment') {
+        const { data, error } = await supabase
+          .from(DB_TABLES.labAppointments)
+          .update({ status: 'cancelled' })
+          .eq('id', fc.args.appointment_id)
+          .eq('patient_phone', patient.phone)
+          .select(`*, ${DB_TABLES.labs}(*)`)
+          .single();
+
+        if (error || !data) {
+          result = createToolError('LAB_CANCEL_FAILED', error?.message || 'Unable to cancel lab appointment.');
+        } else {
+          await fetchData(patient.phone);
+          result = createToolSuccess(normalizeAppointmentRecord(data, 'lab'), 'Lab appointment cancelled successfully.');
+        }
+      } else if (fc.name === 'reschedule_doctor_appointment') {
+        const { data, error } = await supabase
+          .from(DB_TABLES.doctorAppointments)
+          .update({ appointment_time: fc.args.new_time, status: 'scheduled' })
+          .eq('id', fc.args.appointment_id)
+          .eq('patient_phone', patient.phone)
+          .select(`*, ${DB_TABLES.doctors}(*)`)
+          .single();
+
+        if (error || !data) {
+          result = createToolError('DOCTOR_RESCHEDULE_FAILED', error?.message || 'Unable to reschedule doctor appointment.');
+        } else {
+          await fetchData(patient.phone);
+          result = createToolSuccess(normalizeAppointmentRecord(data, 'doctor'), 'Doctor appointment rescheduled successfully.');
+        }
+      } else if (fc.name === 'reschedule_lab_appointment') {
+        const { data, error } = await supabase
+          .from(DB_TABLES.labAppointments)
+          .update({ appointment_time: fc.args.new_time, status: 'scheduled' })
+          .eq('id', fc.args.appointment_id)
+          .eq('patient_phone', patient.phone)
+          .select(`*, ${DB_TABLES.labs}(*)`)
+          .single();
+
+        if (error || !data) {
+          result = createToolError('LAB_RESCHEDULE_FAILED', error?.message || 'Unable to reschedule lab appointment.');
+        } else {
+          await fetchData(patient.phone);
+          result = createToolSuccess(normalizeAppointmentRecord(data, 'lab'), 'Lab appointment rescheduled successfully.');
+        }
+      } else if (fc.name === 'hang_up') {
+        addActionLog('Maya is concluding the call...', 'info');
+        setTimeout(stopMaya, 3500);
+        result = createToolSuccess({ ended: true }, 'Call ended.');
+      } else {
+        result = createToolError('TOOL_NOT_IMPLEMENTED', `Tool '${fc.name}' is not implemented by the app.`);
+      }
+
+      const durationMs = Date.now() - startedAt;
+      await logToDebug(result.success ? 'TOOL_CALL_SUCCEEDED' : 'TOOL_CALL_FAILED', {
+        tool_name: fc.name,
+        duration_ms: durationMs,
+        args: fc.args ?? {},
+        result,
+      });
+      addActionLog(
+        result.success ? `${fc.name} completed` : `${fc.name} failed: ${result.error.message}`,
+        result.success ? 'tool' : 'error',
+      );
+      return result;
+    } catch (error: any) {
+      const result = createToolError('TOOL_EXECUTION_EXCEPTION', error?.message || 'Unexpected tool execution error.');
+      await logToDebug('TOOL_CALL_EXCEPTION', {
+        tool_name: fc.name,
+        args: fc.args ?? {},
+        error_message: error?.message || 'Unknown error',
+      });
+      addActionLog(`${fc.name} failed unexpectedly`, 'error');
+      return result;
+    }
+  }, [patient, logToDebug, addActionLog, fetchData, stopMaya]);
+
   const startMaya = async () => {
     if (isMayaActive || !patient) return;
     
@@ -252,6 +510,10 @@ const App: React.FC = () => {
     setIsMayaActive(true);
     setBotState('initiating');
     sessionStartTimeRef.current = Date.now();
+    sessionIdRef.current = Math.random().toString(36).slice(2);
+    lastUserTranscriptAtRef.current = null;
+    awaitingFirstResponseRef.current = false;
+    lastTranscriptEventAtRef.current = sessionStartTimeRef.current;
     transcriptRef.current = [];
     logToDebug('SESSION_STARTED');
     
@@ -266,7 +528,14 @@ const App: React.FC = () => {
       inputAudioContextRef.current = inCtx;
       outputAudioContextRef.current = outCtx;
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+        }
+      });
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       
       const sessionPromise = ai.live.connect({
@@ -275,10 +544,12 @@ const App: React.FC = () => {
           onopen: () => {
             setBotState('listening');
             logToDebug('WEBSOCKET_OPEN');
+            addActionLog('Maya is connected and listening', 'info');
             const source = inCtx.createMediaStreamSource(stream);
-            const scriptProcessor = inCtx.createScriptProcessor(4096, 1, 1);
+            const scriptProcessor = inCtx.createScriptProcessor(2048, 1, 1);
             
             scriptProcessor.onaudioprocess = (e) => {
+              if (sourcesRef.current.size > 0) return;
               const rawInput = e.inputBuffer.getChannelData(0);
               const resampledData = resample(rawInput, inCtx.sampleRate, 16000);
               const int16 = new Int16Array(resampledData.length);
@@ -291,12 +562,35 @@ const App: React.FC = () => {
             scriptProcessor.connect(inCtx.destination);
           },
           onmessage: async (msg: LiveServerMessage) => {
-            if (msg.serverContent?.inputTranscription) transcriptRef.current.push(`User: ${msg.serverContent.inputTranscription.text}`);
-            if (msg.serverContent?.outputTranscription) transcriptRef.current.push(`Maya: ${msg.serverContent.outputTranscription.text}`);
+            if (msg.serverContent?.inputTranscription?.text) {
+              const userText = msg.serverContent.inputTranscription.text;
+              transcriptRef.current.push(`User: ${userText}`);
+              lastUserTranscriptAtRef.current = Date.now();
+              awaitingFirstResponseRef.current = true;
+              setBotState('processing');
+              addActionLog(`You said: ${userText}`, 'info');
+              logToDebug('USER_TRANSCRIPTION_RECEIVED', { text: userText });
+              persistTranscriptTurn('user', userText);
+            }
+
+            if (msg.serverContent?.outputTranscription?.text) {
+              const mayaText = msg.serverContent.outputTranscription.text;
+              transcriptRef.current.push(`Maya: ${mayaText}`);
+              if (awaitingFirstResponseRef.current) {
+                awaitingFirstResponseRef.current = false;
+                recordToolLatency('FIRST_MODEL_RESPONSE_SENT', { text: mayaText });
+              }
+              logToDebug('MODEL_TRANSCRIPTION_RECEIVED', { text: mayaText });
+              persistTranscriptTurn('maya', mayaText);
+            }
 
             const base64Audio = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
             if (base64Audio) {
               setBotState('speaking');
+              if (awaitingFirstResponseRef.current) {
+                awaitingFirstResponseRef.current = false;
+                recordToolLatency('FIRST_AUDIO_RESPONSE_STARTED');
+              }
               const buffer = await decodeAudioData(decode(base64Audio), outCtx, 24000, 1);
               const source = outCtx.createBufferSource();
               source.buffer = buffer;
@@ -312,38 +606,24 @@ const App: React.FC = () => {
             }
 
             if (msg.toolCall?.functionCalls) {
+              setBotState('processing');
+              recordToolLatency('MODEL_REQUESTED_TOOL', { tool_count: msg.toolCall.functionCalls.length });
               for (const fc of msg.toolCall.functionCalls) {
-                let result: any = "OK";
-                if (fc.name === 'get_doctors') {
-                  const { data } = await supabase.from('doctors').select('*');
-                  result = data;
-                  addActionLog('Maya checked Doctors', 'tool');
-                } else if (fc.name === 'get_labs') {
-                  const { data } = await supabase.from('labs').select('*');
-                  result = data;
-                } else if (fc.name === 'get_opd_timings') {
-                  const { data } = await supabase.from('opd_timings').select('*');
-                  result = data;
-                } else if (fc.name === 'book_doctor_appointment') {
-                  const newAppt = { patient_phone: patient.phone, doctor_id: fc.args.doctor_id, appointment_time: fc.args.appointment_time, status: 'scheduled' };
-                  const { data, error } = await supabase.from('doctor_appointments').insert([newAppt]).select('*, doctors(*)').single();
-                  if (data) { setAppointments(prev => [data as any, ...prev]); result = "Success"; addActionLog('Maya booked Doctor visit', 'tool'); }
-                  else result = `Error: ${error?.message}`;
-                } else if (fc.name === 'book_lab_appointment') {
-                  const newAppt = { patient_phone: patient.phone, lab_id: fc.args.lab_id, appointment_time: fc.args.appointment_time, status: 'scheduled' };
-                  const { data, error } = await supabase.from('lab_appointments').insert([newAppt]).select('*, labs(*)').single();
-                  if (data) { setAppointments(prev => [data as any, ...prev]); result = "Success"; addActionLog('Maya booked Lab test', 'tool'); }
-                  else result = `Error: ${error?.message}`;
-                } else if (fc.name === 'hang_up') {
-                  addActionLog('Maya is concluding the call...', 'info');
-                  setTimeout(stopMaya, 3500);
-                }
-                sessionPromise.then(s => s.sendToolResponse({ functionResponses: { id: fc.id, name: fc.name, response: { result } } }));
+                const result = await executeToolCall(fc);
+                await logToDebug('TOOL_RESPONSE_SENT', { tool_name: fc.name, result });
+                sessionPromise.then(s => s.sendToolResponse({ functionResponses: { id: fc.id, name: fc.name, response: result } }));
               }
             }
           },
-          onerror: (e) => { stopMaya(); },
-          onclose: (e) => { stopMaya(); }
+          onerror: (e) => {
+            addActionLog('Voice session error occurred', 'error');
+            logToDebug('WEBSOCKET_ERROR', { error: String((e as any)?.message || e) });
+            stopMaya();
+          },
+          onclose: (e) => {
+            logToDebug('WEBSOCKET_CLOSED', { code: (e as any)?.code, reason: (e as any)?.reason });
+            stopMaya();
+          }
         },
         config: {
           responseModalities: [Modality.AUDIO],
