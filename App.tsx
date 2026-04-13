@@ -110,6 +110,21 @@ const normalizeDoctorSlotRecord = (slot: any) => ({
   doctor_specialty: slot.doctor?.specialty ?? null,
 });
 
+const normalizeLabSlotRecord = (slot: any) => ({
+  id: slot.id,
+  lab_id: slot.lab_id,
+  start_time: slot.start_time,
+  is_available: slot.is_available,
+  booked_by_phone: slot.booked_by_phone ?? null,
+  appointment_id: slot.appointment_id ?? null,
+  lab_test_name: slot.lab?.test_name ?? null,
+});
+
+const formatDoctorName = (name: string, specialty: string) => {
+  const cleanName = name.replace(/^Dr\.?\s*/i, '');
+  return `Dr. ${cleanName}, ${specialty}`;
+};
+
 const clearDoctorSlotBookingFields = {
   is_available: true,
   booked_by_phone: null,
@@ -470,6 +485,27 @@ const App: React.FC = () => {
             ? createToolError('DOCTOR_SLOTS_FETCH_FAILED', error.message)
             : createToolSuccess((data ?? []).map(normalizeDoctorSlotRecord));
         }
+      } else if (fc.name === 'get_lab_slots') {
+        if (!fc.args?.lab_id) {
+          result = createToolError('LAB_ID_REQUIRED', 'A lab_id is required to check lab slots.');
+        } else {
+          const startDate =
+            typeof fc.args.start_date === 'string' && fc.args.start_date.trim().length > 0
+              ? new Date(fc.args.start_date).toISOString()
+              : new Date().toISOString();
+
+          const { data, error } = await supabase
+            .from(DB_TABLES.labSlots)
+            .select(`*, lab:${DB_TABLES.labs}(id, test_name)`)
+            .eq('lab_id', fc.args.lab_id)
+            .eq('is_available', true)
+            .gte('start_time', startDate)
+            .order('start_time', { ascending: true });
+
+          result = error
+            ? createToolError('LAB_SLOTS_FETCH_FAILED', error.message)
+            : createToolSuccess((data ?? []).map(normalizeLabSlotRecord));
+        }
       } else if (fc.name === 'get_labs') {
         const { data, error } = await supabase.from(DB_TABLES.labs).select('*');
         result = error
@@ -618,23 +654,68 @@ const App: React.FC = () => {
           }
         }
       } else if (fc.name === 'book_lab_appointment') {
-        const newAppt = {
-          patient_phone: patient.phone,
-          lab_id: fc.args.lab_id,
-          appointment_time: fc.args.appointment_time,
-          status: 'scheduled',
-        };
-        const { data, error } = await supabase
-          .from(DB_TABLES.labAppointments)
-          .insert([newAppt])
-          .select(`*, ${DB_TABLES.labs}(*)`)
-          .single();
-
-        if (error || !data) {
-          result = createToolError('LAB_BOOK_FAILED', error?.message || 'Unable to book lab appointment.');
+        if (!fc.args?.lab_id) {
+          result = createToolError('LAB_ID_REQUIRED', 'A valid lab_id is required to book a lab appointment.');
         } else {
-          setAppointments((prev) => [data as any, ...prev]);
-          result = createToolSuccess(normalizeAppointmentRecord(data, 'lab'), 'Lab appointment booked successfully.');
+          const requestedTime =
+            typeof fc.args.appointment_time === 'string' && fc.args.appointment_time.trim().length > 0
+              ? new Date(fc.args.appointment_time).toISOString()
+              : null;
+
+          let slotQuery = supabase
+            .from(DB_TABLES.labSlots)
+            .select('*')
+            .eq('lab_id', fc.args.lab_id)
+            .eq('is_available', true);
+
+          if (fc.args.slot_id) {
+            slotQuery = slotQuery.eq('id', fc.args.slot_id);
+          } else if (requestedTime) {
+            slotQuery = slotQuery.eq('start_time', requestedTime);
+          } else {
+            result = createToolError(
+              'LAB_SLOT_REQUIRED',
+              'A real lab slot is required before booking. Please check lab slots first.',
+            );
+            logToDebug('TOOL_CALL_FAILED', { tool_name: fc.name, duration_ms: Date.now() - startedAt, args: fc.args ?? {}, result });
+            addActionLog(`${fc.name} failed: ${result.error.message}`, 'error');
+            return result;
+          }
+
+          const { data: slot, error: slotError } = await slotQuery.single();
+
+          if (slotError || !slot) {
+            result = createToolError('LAB_SLOT_NOT_AVAILABLE', 'The requested lab slot is not available. Please choose a real available slot.');
+          } else if (slot.lab_id !== fc.args.lab_id) {
+            result = createToolError('LAB_SLOT_MISMATCH', 'The requested slot does not belong to the selected lab.');
+          } else {
+            const { data: appointment, error: appointmentError } = await supabase
+              .from(DB_TABLES.labAppointments)
+              .insert([{ patient_phone: patient.phone, lab_id: fc.args.lab_id, appointment_time: slot.start_time, status: 'scheduled' }])
+              .select(`*, ${DB_TABLES.labs}(*)`)
+              .single();
+
+            if (appointmentError || !appointment) {
+              result = createToolError('LAB_BOOK_FAILED', appointmentError?.message || 'Unable to book lab appointment.');
+            } else {
+              const { error: slotUpdateError } = await supabase
+                .from(DB_TABLES.labSlots)
+                .update({ is_available: false, booked_by_phone: patient.phone, appointment_id: appointment.id })
+                .eq('id', slot.id)
+                .eq('is_available', true);
+
+              if (slotUpdateError) {
+                result = createToolError('LAB_SLOT_UPDATE_FAILED', `Appointment created but slot could not be marked booked: ${slotUpdateError.message}`,
+                  { appointment: normalizeAppointmentRecord(appointment, 'lab'), slot: normalizeLabSlotRecord(slot) });
+              } else {
+                setAppointments(prev => [appointment as any, ...prev]);
+                result = createToolSuccess(
+                  { appointment: normalizeAppointmentRecord(appointment, 'lab'), slot: normalizeLabSlotRecord({ ...slot, is_available: false, booked_by_phone: patient.phone, appointment_id: appointment.id }) },
+                  'Lab appointment booked successfully.',
+                );
+              }
+            }
+          }
         }
       } else if (fc.name === 'cancel_doctor_appointment') {
         const { data, error } = await supabase
@@ -676,8 +757,19 @@ const App: React.FC = () => {
         if (error || !data) {
           result = createToolError('LAB_CANCEL_FAILED', error?.message || 'Unable to cancel lab appointment.');
         } else {
-          await fetchData(patient.phone);
-          result = createToolSuccess(normalizeAppointmentRecord(data, 'lab'), 'Lab appointment cancelled successfully.');
+          const { error: slotReleaseError } = await supabase
+            .from(DB_TABLES.labSlots)
+            .update({ is_available: true, booked_by_phone: null, appointment_id: null })
+            .eq('appointment_id', data.id);
+
+          if (slotReleaseError) {
+            result = createToolError('LAB_SLOT_RELEASE_FAILED',
+              `Appointment was cancelled but the slot could not be released: ${slotReleaseError.message}`,
+              { appointment: normalizeAppointmentRecord(data, 'lab') });
+          } else {
+            await fetchData(patient.phone);
+            result = createToolSuccess(normalizeAppointmentRecord(data, 'lab'), 'Lab appointment cancelled successfully.');
+          }
         }
       } else if (fc.name === 'reschedule_doctor_appointment') {
         const { data: currentAppointment, error: currentAppointmentError } = await supabase
@@ -796,19 +888,84 @@ const App: React.FC = () => {
           }
         }
       } else if (fc.name === 'reschedule_lab_appointment') {
-        const { data, error } = await supabase
+        const { data: currentAppointment, error: currentAppointmentError } = await supabase
           .from(DB_TABLES.labAppointments)
-          .update({ appointment_time: fc.args.new_time, status: 'scheduled' })
+          .select('*')
           .eq('id', fc.args.appointment_id)
           .eq('patient_phone', patient.phone)
-          .select(`*, ${DB_TABLES.labs}(*)`)
           .single();
 
-        if (error || !data) {
-          result = createToolError('LAB_RESCHEDULE_FAILED', error?.message || 'Unable to reschedule lab appointment.');
+        if (currentAppointmentError || !currentAppointment) {
+          result = createToolError('LAB_APPOINTMENT_NOT_FOUND', currentAppointmentError?.message || 'Unable to find lab appointment to reschedule.');
         } else {
-          await fetchData(patient.phone);
-          result = createToolSuccess(normalizeAppointmentRecord(data, 'lab'), 'Lab appointment rescheduled successfully.');
+          const requestedTime =
+            typeof fc.args.new_time === 'string' && fc.args.new_time.trim().length > 0
+              ? new Date(fc.args.new_time).toISOString()
+              : null;
+
+          let slotQuery = supabase
+            .from(DB_TABLES.labSlots)
+            .select('*')
+            .eq('lab_id', currentAppointment.lab_id)
+            .eq('is_available', true);
+
+          if (fc.args.slot_id) {
+            slotQuery = slotQuery.eq('id', fc.args.slot_id);
+          } else if (requestedTime) {
+            slotQuery = slotQuery.eq('start_time', requestedTime);
+          } else {
+            result = createToolError('LAB_SLOT_REQUIRED', 'A real available slot is required before rescheduling. Please check lab slots first.');
+            logToDebug('TOOL_CALL_FAILED', { tool_name: fc.name, duration_ms: Date.now() - startedAt, args: fc.args ?? {}, result });
+            addActionLog(`${fc.name} failed: ${result.error.message}`, 'error');
+            return result;
+          }
+
+          const { data: newSlot, error: newSlotError } = await slotQuery.single();
+
+          if (newSlotError || !newSlot) {
+            result = createToolError('LAB_SLOT_NOT_AVAILABLE', 'The requested new lab slot is not available. Please choose a real available slot.');
+          } else {
+            const { data: updatedAppointment, error: updateError } = await supabase
+              .from(DB_TABLES.labAppointments)
+              .update({ appointment_time: newSlot.start_time, status: 'scheduled' })
+              .eq('id', fc.args.appointment_id)
+              .eq('patient_phone', patient.phone)
+              .select(`*, ${DB_TABLES.labs}(*)`)
+              .single();
+
+            if (updateError || !updatedAppointment) {
+              result = createToolError('LAB_RESCHEDULE_FAILED', updateError?.message || 'Unable to reschedule lab appointment.');
+            } else {
+              const { error: releaseOldSlotError } = await supabase
+                .from(DB_TABLES.labSlots)
+                .update({ is_available: true, booked_by_phone: null, appointment_id: null })
+                .eq('appointment_id', currentAppointment.id);
+
+              if (releaseOldSlotError) {
+                result = createToolError('LAB_OLD_SLOT_RELEASE_FAILED',
+                  `Appointment was moved but the old slot could not be released: ${releaseOldSlotError.message}`,
+                  { appointment: normalizeAppointmentRecord(updatedAppointment, 'lab') });
+              } else {
+                const { error: reserveNewSlotError } = await supabase
+                  .from(DB_TABLES.labSlots)
+                  .update({ is_available: false, booked_by_phone: patient.phone, appointment_id: updatedAppointment.id })
+                  .eq('id', newSlot.id)
+                  .eq('is_available', true);
+
+                if (reserveNewSlotError) {
+                  result = createToolError('LAB_NEW_SLOT_RESERVE_FAILED',
+                    `Appointment was moved but the new slot could not be reserved: ${reserveNewSlotError.message}`,
+                    { appointment: normalizeAppointmentRecord(updatedAppointment, 'lab'), slot: normalizeLabSlotRecord(newSlot) });
+                } else {
+                  await fetchData(patient.phone);
+                  result = createToolSuccess(
+                    { appointment: normalizeAppointmentRecord(updatedAppointment, 'lab'), slot: normalizeLabSlotRecord({ ...newSlot, is_available: false, booked_by_phone: patient.phone, appointment_id: updatedAppointment.id }) },
+                    'Lab appointment rescheduled successfully.',
+                  );
+                }
+              }
+            }
+          }
         }
       } else if (fc.name === 'hang_up') {
         addActionLog('Maya is concluding the call...', 'info');
@@ -889,7 +1046,7 @@ const App: React.FC = () => {
             const scriptProcessor = inCtx.createScriptProcessor(2048, 1, 1);
             
             scriptProcessor.onaudioprocess = (e) => {
-              if (!sessionActiveRef.current || sourcesRef.current.size > 0) return;
+              if (!sessionActiveRef.current) return;
               const rawInput = e.inputBuffer.getChannelData(0);
               const resampledData = resample(rawInput, inCtx.sampleRate, 16000);
               const int16 = new Int16Array(resampledData.length);
@@ -933,6 +1090,15 @@ const App: React.FC = () => {
             // turnComplete signals the end of a full conversational turn — flush accumulated transcripts
             if (msg.serverContent?.turnComplete) {
               flushPendingTurnTranscripts();
+            }
+
+            // User interrupted Maya mid-speech — stop all queued audio immediately
+            if (msg.serverContent?.interrupted) {
+              sourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
+              sourcesRef.current.clear();
+              nextStartTimeRef.current = 0;
+              setBotState('listening');
+              addActionLog('Interrupted by user', 'info');
             }
 
             const base64Audio = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
@@ -1057,7 +1223,7 @@ const App: React.FC = () => {
                     <div className="flex items-center space-x-4 min-w-0">
                       <div className="w-11 h-11 rounded-lg bg-indigo-50 flex items-center justify-center text-indigo-600 shrink-0">{app.lab_id ? <FlaskConical className="w-6 h-6" /> : <User className="w-6 h-6" />}</div>
                       <div className="min-w-0">
-                        <h4 className="font-bold text-slate-900 text-[15px] truncate">{app.doctors?.name ? `Dr. ${app.doctors.name}, ${app.doctors.specialty}` : app.labs?.test_name ? app.labs.test_name : 'Medical Visit'}</h4>
+                        <h4 className="font-bold text-slate-900 text-[15px] truncate">{app.doctors?.name ? formatDoctorName(app.doctors.name, app.doctors.specialty) : app.labs?.test_name ? app.labs.test_name : 'Medical Visit'}</h4>
                         <p className="text-[11px] font-black text-indigo-600 uppercase mt-1">{formatFriendlyIST(app.appointment_time)}</p>
                       </div>
                     </div>
@@ -1095,7 +1261,7 @@ const App: React.FC = () => {
                     <div className="flex items-center space-x-4 min-w-0">
                       <div className="w-11 h-11 rounded-lg bg-slate-50 flex items-center justify-center text-slate-400 shrink-0">{app.status === 'cancelled' ? <AlertCircle className="w-6 h-6" /> : <CheckCircle2 className="w-6 h-6" />}</div>
                       <div className="min-w-0">
-                        <h4 className="font-bold text-slate-600 text-[15px] truncate">{app.doctors?.name ? `Dr. ${app.doctors.name}, ${app.doctors.specialty}` : app.labs?.test_name ? app.labs.test_name : 'Medical Visit'}</h4>
+                        <h4 className="font-bold text-slate-600 text-[15px] truncate">{app.doctors?.name ? formatDoctorName(app.doctors.name, app.doctors.specialty) : app.labs?.test_name ? app.labs.test_name : 'Medical Visit'}</h4>
                         <p className="text-[11px] font-black text-slate-400 uppercase mt-1">{app.status.toUpperCase()} • {formatFriendlyIST(app.appointment_time)}</p>
                       </div>
                     </div>

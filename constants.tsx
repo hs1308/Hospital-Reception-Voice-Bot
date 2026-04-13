@@ -17,11 +17,12 @@ export const SYSTEM_INSTRUCTION = `
 - **Doctor Discovery:** Use 'get_doctors' to find specialists.
 - **Doctor Slot Availability:** Use 'get_doctor_slots' to find real bookable doctor slots.
 - **Lab Discovery:** Use 'get_labs' to list available tests and prices.
+- **Lab Slot Availability:** Use 'get_lab_slots' to find real bookable lab slots.
 - **OPD Info:** Use 'get_opd_timings' to find room numbers and schedules.
 - **Appointments:** 
     - Use 'get_patient_appointments' to check existing ones.
-    - Use 'book_doctor_appointment' for new doctor visits.
-    - Use 'book_lab_appointment' for lab tests.
+    - Use 'book_doctor_appointment' for new doctor visits (requires a real slot from get_doctor_slots).
+    - Use 'book_lab_appointment' for lab tests (requires a real slot from get_lab_slots).
     - Use 'cancel_doctor_appointment' to remove a doctor booking.
     - Use 'cancel_lab_appointment' to remove a lab booking.
     - Use 'reschedule_doctor_appointment' to change a doctor visit.
@@ -44,10 +45,12 @@ export const SYSTEM_INSTRUCTION = `
 
 ## 6. GUIDELINES
 - Be warm, professional, and efficient.
+- **LANGUAGE:** Always respond in the same language the user last spoke. If the user switches from English to Hindi mid-conversation, immediately switch to Hindi for all subsequent responses. Match the user's language at all times.
 - Always verify the doctor's name or test name before booking.
 - For any request about appointments, bookings, cancellations, or reschedules, you MUST use the relevant tool before answering.
 - Never use OPD timings as proof of a bookable appointment slot.
 - Before suggesting or booking a doctor appointment, you MUST check 'get_doctor_slots'.
+- Before suggesting or booking a lab appointment, you MUST check 'get_lab_slots'.
 - For specialty requests:
     - First check 'get_doctors' for matching specialists.
     - If none exist, clearly say that specialty is unavailable and offer the specialties that are available.
@@ -81,6 +84,18 @@ export const TOOLS: FunctionDeclaration[] = [
     }
   },
   {
+    name: 'get_lab_slots',
+    description: 'Retrieves real bookable slots for a lab test from the lab slots table.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        lab_id: { type: Type.STRING, description: 'Lab UUID from get_labs.' },
+        start_date: { type: Type.STRING, description: 'Optional ISO date or datetime to filter slots from.' }
+      },
+      required: ['lab_id']
+    }
+  },
+  {
     name: 'get_labs',
     description: 'Retrieves list of available lab tests and prices.',
     parameters: { type: Type.OBJECT, properties: {} }
@@ -105,14 +120,15 @@ export const TOOLS: FunctionDeclaration[] = [
   },
   {
     name: 'book_lab_appointment',
-    description: 'Books a new lab test appointment.',
+    description: 'Books a new lab test appointment using a real slot from get_lab_slots.',
     parameters: {
       type: Type.OBJECT,
       properties: {
-        lab_id: { type: Type.STRING },
-        appointment_time: { type: Type.STRING }
+        lab_id: { type: Type.STRING, description: 'Lab UUID from get_labs.' },
+        slot_id: { type: Type.STRING, description: 'Slot UUID from get_lab_slots.' },
+        appointment_time: { type: Type.STRING, description: 'Optional ISO string date. Use only if matching a real slot time.' }
       },
-      required: ['lab_id', 'appointment_time']
+      required: ['lab_id']
     }
   },
   {
@@ -157,14 +173,15 @@ export const TOOLS: FunctionDeclaration[] = [
   },
   {
     name: 'reschedule_lab_appointment',
-    description: 'Changes the time of an existing lab appointment.',
+    description: 'Changes the time of an existing lab appointment using a real available slot and frees the old slot.',
     parameters: {
       type: Type.OBJECT,
       properties: {
         appointment_id: { type: Type.STRING },
+        slot_id: { type: Type.STRING, description: 'Optional target slot UUID from get_lab_slots.' },
         new_time: { type: Type.STRING, description: 'ISO string date' }
       },
-      required: ['appointment_id', 'new_time']
+      required: ['appointment_id']
     }
   },
   {
