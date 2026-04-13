@@ -175,6 +175,10 @@ const App: React.FC = () => {
   const lastTranscriptEventAtRef = useRef<number | null>(null);
   const transcriptFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const transcriptBufferRef = useRef<{ speaker: 'user' | 'maya'; text: string }[]>([]);
+  // Accumulates partial word fragments per speaker until turnComplete fires
+  const pendingUserTranscriptRef = useRef<string>('');
+  const pendingMayaTranscriptRef = useRef<string>('');
+  const sessionActiveRef = useRef<boolean>(false);
 
   useEffect(() => {
     const saved = localStorage.getItem('nurse_maya_patient');
@@ -247,20 +251,56 @@ const App: React.FC = () => {
     });
   }, [patient]);
 
-  // Buffers transcript fragments and debounces the write by 2 seconds
-  const persistTranscriptTurn = useCallback((speaker: 'user' | 'maya', transcript: string) => {
-    if (!isSupabaseConfigured() || !patient || !sessionIdRef.current || !transcript.trim()) return;
+  // Appends a partial transcription fragment to the pending buffer for that speaker.
+  // The full turn is only written to DB when turnComplete fires.
+  const accumulateTranscript = useCallback((speaker: 'user' | 'maya', fragment: string) => {
+    if (!fragment.trim()) return;
+    if (speaker === 'user') {
+      pendingUserTranscriptRef.current += (pendingUserTranscriptRef.current ? ' ' : '') + fragment.trim();
+    } else {
+      pendingMayaTranscriptRef.current += (pendingMayaTranscriptRef.current ? ' ' : '') + fragment.trim();
+    }
+  }, []);
 
-    const now = Date.now();
-    lastTranscriptEventAtRef.current = now;
+  // Called when turnComplete fires — flushes both pending transcripts as one batch insert
+  const flushPendingTurnTranscripts = useCallback(() => {
+    if (!isSupabaseConfigured() || !patient || !sessionIdRef.current) return;
+    const rows: any[] = [];
+    const now = new Date().toISOString();
 
-    transcriptBufferRef.current.push({ speaker, text: transcript.trim() });
+    if (pendingUserTranscriptRef.current.trim()) {
+      rows.push({
+        session_id: sessionIdRef.current,
+        speaker: 'user',
+        patient_phone: patient.phone,
+        patient_name: patient.name,
+        started_at: now,
+        ended_at: now,
+        language: navigator.language || 'unknown',
+        transcript: pendingUserTranscriptRef.current.trim(),
+      });
+      pendingUserTranscriptRef.current = '';
+    }
 
-    if (transcriptFlushTimerRef.current) clearTimeout(transcriptFlushTimerRef.current);
-    transcriptFlushTimerRef.current = setTimeout(() => {
-      flushTranscriptBuffer();
-    }, 2000);
-  }, [patient, flushTranscriptBuffer]);
+    if (pendingMayaTranscriptRef.current.trim()) {
+      rows.push({
+        session_id: sessionIdRef.current,
+        speaker: 'maya',
+        patient_phone: patient.phone,
+        patient_name: patient.name,
+        started_at: now,
+        ended_at: now,
+        language: navigator.language || 'unknown',
+        transcript: pendingMayaTranscriptRef.current.trim(),
+      });
+      pendingMayaTranscriptRef.current = '';
+    }
+
+    if (rows.length === 0) return;
+    supabase.from(DB_TABLES.sessionTranscripts).insert(rows).then(({ error }) => {
+      if (error) console.warn('Transcript turn flush failed', error);
+    });
+  }, [patient]);
 
   const fetchData = useCallback(async (phone: string) => {
     if (!isSupabaseConfigured()) return;
@@ -292,8 +332,8 @@ const App: React.FC = () => {
       if (drError) addActionLog(`Sync Error: ${drError.message}`, 'error');
 
       const combined = [
-        ...(drData || []).map(a => ({ ...a, type: 'doctor' })),
-        ...(labData || []).map(a => ({ ...a, type: 'lab' }))
+        ...(drData || []).map(a => ({ ...a, type: 'doctor', doctors: (a as any).maya_doctors ?? (a as any).doctors ?? null })),
+        ...(labData || []).map(a => ({ ...a, type: 'lab', labs: (a as any).maya_labs ?? (a as any).labs ?? null }))
       ].sort((a, b) => new Date(b.appointment_time).getTime() - new Date(a.appointment_time).getTime());
 
       setAppointments(combined as any);
@@ -312,6 +352,7 @@ const App: React.FC = () => {
 
     setBotState('idle');
     setIsMayaActive(false);
+    sessionActiveRef.current = false;
     
     const finalTranscript = transcriptRef.current.join(' ');
     const startTime = sessionStartTimeRef.current;
@@ -366,10 +407,13 @@ const App: React.FC = () => {
     awaitingFirstResponseRef.current = false;
     lastTranscriptEventAtRef.current = null;
     transcriptRef.current = [];
-    // Flush any buffered transcript turns and clear debounce timer
+    // Flush any remaining transcript turns then reset all transcript state
     if (transcriptFlushTimerRef.current) clearTimeout(transcriptFlushTimerRef.current);
+    flushPendingTurnTranscripts();
     await flushTranscriptBuffer();
     transcriptBufferRef.current = [];
+    pendingUserTranscriptRef.current = '';
+    pendingMayaTranscriptRef.current = '';
     if (sessionRef.current) try { await sessionRef.current.close(); } catch(e) {}
     sourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
     sourcesRef.current.clear();
@@ -386,7 +430,7 @@ const App: React.FC = () => {
 
     addActionLog('Maya session concluded', 'info');
     logToDebug('SESSION_ENDED');
-  }, [patient, addActionLog, logToDebug, flushTranscriptBuffer]);
+  }, [patient, addActionLog, logToDebug, flushTranscriptBuffer, flushPendingTurnTranscripts]);
 
   const executeToolCall = useCallback(async (fc: any): Promise<ToolResult> => {
     if (!patient) {
@@ -804,6 +848,7 @@ const App: React.FC = () => {
 
     setIsMayaActive(true);
     setBotState('initiating');
+    sessionActiveRef.current = true;
     sessionStartTimeRef.current = Date.now();
     sessionIdRef.current = Math.random().toString(36).slice(2);
     lastUserTranscriptAtRef.current = null;
@@ -837,14 +882,14 @@ const App: React.FC = () => {
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         callbacks: {
           onopen: () => {
-            setBotState('listening');
+            setBotState('speaking');
             logToDebug('WEBSOCKET_OPEN');
             addActionLog('Maya is connected and listening', 'info');
             const source = inCtx.createMediaStreamSource(stream);
             const scriptProcessor = inCtx.createScriptProcessor(2048, 1, 1);
             
             scriptProcessor.onaudioprocess = (e) => {
-              if (sourcesRef.current.size > 0) return;
+              if (!sessionActiveRef.current || sourcesRef.current.size > 0) return;
               const rawInput = e.inputBuffer.getChannelData(0);
               const resampledData = resample(rawInput, inCtx.sampleRate, 16000);
               const int16 = new Int16Array(resampledData.length);
@@ -855,6 +900,12 @@ const App: React.FC = () => {
             };
             source.connect(scriptProcessor);
             scriptProcessor.connect(inCtx.destination);
+
+            // Trigger Maya's greeting immediately so she speaks first before the user says anything
+            sessionPromise.then(s => s.sendClientContent({
+              turns: [{ role: 'user', parts: [{ text: '__GREET__' }] }],
+              turnComplete: true,
+            }));
           },
           onmessage: async (msg: LiveServerMessage) => {
             if (msg.serverContent?.inputTranscription?.text) {
@@ -865,7 +916,7 @@ const App: React.FC = () => {
               setBotState('processing');
               addActionLog(`You said: ${userText}`, 'info');
               logToDebug('USER_TRANSCRIPTION_RECEIVED', { text: userText });
-              persistTranscriptTurn('user', userText);
+              accumulateTranscript('user', userText);
             }
 
             if (msg.serverContent?.outputTranscription?.text) {
@@ -876,7 +927,12 @@ const App: React.FC = () => {
                 recordToolLatency('FIRST_MODEL_RESPONSE_SENT', { text: mayaText });
               }
               logToDebug('MODEL_TRANSCRIPTION_RECEIVED', { text: mayaText });
-              persistTranscriptTurn('maya', mayaText);
+              accumulateTranscript('maya', mayaText);
+            }
+
+            // turnComplete signals the end of a full conversational turn — flush accumulated transcripts
+            if (msg.serverContent?.turnComplete) {
+              flushPendingTurnTranscripts();
             }
 
             const base64Audio = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
@@ -1001,7 +1057,7 @@ const App: React.FC = () => {
                     <div className="flex items-center space-x-4 min-w-0">
                       <div className="w-11 h-11 rounded-lg bg-indigo-50 flex items-center justify-center text-indigo-600 shrink-0">{app.lab_id ? <FlaskConical className="w-6 h-6" /> : <User className="w-6 h-6" />}</div>
                       <div className="min-w-0">
-                        <h4 className="font-bold text-slate-900 text-[15px] truncate">{app.doctors ? `${app.doctors.name}, ${app.doctors.specialty}` : (app.labs?.test_name || 'Medical Visit')}</h4>
+                        <h4 className="font-bold text-slate-900 text-[15px] truncate">{app.doctors?.name ? `Dr. ${app.doctors.name}, ${app.doctors.specialty}` : app.labs?.test_name ? app.labs.test_name : 'Medical Visit'}</h4>
                         <p className="text-[11px] font-black text-indigo-600 uppercase mt-1">{formatFriendlyIST(app.appointment_time)}</p>
                       </div>
                     </div>
@@ -1039,7 +1095,7 @@ const App: React.FC = () => {
                     <div className="flex items-center space-x-4 min-w-0">
                       <div className="w-11 h-11 rounded-lg bg-slate-50 flex items-center justify-center text-slate-400 shrink-0">{app.status === 'cancelled' ? <AlertCircle className="w-6 h-6" /> : <CheckCircle2 className="w-6 h-6" />}</div>
                       <div className="min-w-0">
-                        <h4 className="font-bold text-slate-600 text-[15px] truncate">{app.doctors ? `${app.doctors.name}, ${app.doctors.specialty}` : (app.labs?.test_name || 'Medical Visit')}</h4>
+                        <h4 className="font-bold text-slate-600 text-[15px] truncate">{app.doctors?.name ? `Dr. ${app.doctors.name}, ${app.doctors.specialty}` : app.labs?.test_name ? app.labs.test_name : 'Medical Visit'}</h4>
                         <p className="text-[11px] font-black text-slate-400 uppercase mt-1">{app.status.toUpperCase()} • {formatFriendlyIST(app.appointment_time)}</p>
                       </div>
                     </div>
