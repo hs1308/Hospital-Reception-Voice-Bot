@@ -116,6 +116,39 @@ const clearDoctorSlotBookingFields = {
   appointment_id: null,
 };
 
+const SkeletonCard = () => (
+  <div className="space-y-3">
+    {[1, 2].map(i => (
+      <div key={i} className="bg-white border border-slate-100 p-4 rounded-xl flex items-center space-x-4 animate-pulse">
+        <div className="w-11 h-11 rounded-lg bg-slate-100 shrink-0" />
+        <div className="flex-1 space-y-2">
+          <div className="h-3 bg-slate-100 rounded w-3/4" />
+          <div className="h-2 bg-slate-100 rounded w-1/3" />
+        </div>
+      </div>
+    ))}
+  </div>
+);
+
+const SummarySkeletonCard = () => (
+  <div className="col-span-full grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+    {[1, 2, 3].map(i => (
+      <div key={i} className="bg-white border border-slate-100 p-5 rounded-xl space-y-3 animate-pulse">
+        <div className="flex items-center justify-between">
+          <div className="w-8 h-8 rounded-lg bg-slate-100" />
+          <div className="h-2 bg-slate-100 rounded w-1/3" />
+        </div>
+        <div className="space-y-2">
+          <div className="h-2 bg-slate-100 rounded w-full" />
+          <div className="h-2 bg-slate-100 rounded w-5/6" />
+          <div className="h-2 bg-slate-100 rounded w-4/6" />
+        </div>
+        <div className="h-2 bg-slate-100 rounded w-1/4 pt-1" />
+      </div>
+    ))}
+  </div>
+);
+
 const App: React.FC = () => {
   const [patient, setPatient] = useState<Patient | null>(null);
   const [appointments, setAppointments] = useState<Appointment[]>([]);
@@ -123,7 +156,8 @@ const App: React.FC = () => {
   const [botState, setBotState] = useState<BotState>('idle');
   const [actionLogs, setActionLogs] = useState<LogType[]>([]);
   const [isMayaActive, setIsMayaActive] = useState(false);
-  
+  const [isLoading, setIsLoading] = useState(false);
+
   // Pagination State
   const [upcomingPage, setUpcomingPage] = useState(1);
   const [pastPage, setPastPage] = useState(1);
@@ -139,6 +173,8 @@ const App: React.FC = () => {
   const lastUserTranscriptAtRef = useRef<number | null>(null);
   const awaitingFirstResponseRef = useRef(false);
   const lastTranscriptEventAtRef = useRef<number | null>(null);
+  const transcriptFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const transcriptBufferRef = useRef<{ speaker: 'user' | 'maya'; text: string }[]>([]);
 
   useEffect(() => {
     const saved = localStorage.getItem('nurse_maya_patient');
@@ -166,21 +202,19 @@ const App: React.FC = () => {
     setActionLogs(prev => [newLog, ...prev.slice(0, 20)]);
   }, []);
 
-  const logToDebug = useCallback(async (event: string, metadata: any = {}) => {
+  const logToDebug = useCallback((event: string, metadata: any = {}) => {
     if (!isSupabaseConfigured() || !patient) return;
-    try {
-      await supabase.from(DB_TABLES.mayaDebugLogs).insert([{
-        patient_phone: patient.phone,
-        event,
-        metadata: {
-          session_id: sessionIdRef.current,
-          ...metadata,
-        },
-        timestamp: new Date().toISOString()
-      }]);
-    } catch (e) {
-      console.warn('Debug logging failed', e);
-    }
+    supabase.from(DB_TABLES.mayaDebugLogs).insert([{
+      patient_phone: patient.phone,
+      event,
+      metadata: {
+        session_id: sessionIdRef.current,
+        ...metadata,
+      },
+      timestamp: new Date().toISOString()
+    }]).then(({ error }) => {
+      if (error) console.warn('Debug logging failed', error);
+    });
   }, [patient]);
 
   const recordToolLatency = useCallback((event: string, extra: any = {}) => {
@@ -189,64 +223,84 @@ const App: React.FC = () => {
     logToDebug(event, { latency_ms: latencyMs, ...extra });
   }, [logToDebug]);
 
-  const persistTranscriptTurn = useCallback(async (speaker: 'user' | 'maya', transcript: string) => {
+  // Flushes the accumulated transcript buffer to Supabase in a single insert
+  const flushTranscriptBuffer = useCallback(async () => {
+    if (!isSupabaseConfigured() || !patient || !sessionIdRef.current) return;
+    const turns = transcriptBufferRef.current;
+    if (turns.length === 0) return;
+    transcriptBufferRef.current = [];
+
+    const now = new Date();
+    const rows = turns.map(turn => ({
+      session_id: sessionIdRef.current!,
+      speaker: turn.speaker,
+      patient_phone: patient.phone,
+      patient_name: patient.name,
+      started_at: now.toISOString(),
+      ended_at: now.toISOString(),
+      language: navigator.language || 'unknown',
+      transcript: turn.text,
+    }));
+
+    supabase.from(DB_TABLES.sessionTranscripts).insert(rows).then(({ error }) => {
+      if (error) console.warn('Transcript flush failed', error);
+    });
+  }, [patient]);
+
+  // Buffers transcript fragments and debounces the write by 2 seconds
+  const persistTranscriptTurn = useCallback((speaker: 'user' | 'maya', transcript: string) => {
     if (!isSupabaseConfigured() || !patient || !sessionIdRef.current || !transcript.trim()) return;
 
-    const endedAt = new Date();
-    const startedAt = lastTranscriptEventAtRef.current
-      ? new Date(lastTranscriptEventAtRef.current)
-      : endedAt;
+    const now = Date.now();
+    lastTranscriptEventAtRef.current = now;
 
-    lastTranscriptEventAtRef.current = endedAt.getTime();
+    transcriptBufferRef.current.push({ speaker, text: transcript.trim() });
 
-    try {
-      await supabase.from(DB_TABLES.sessionTranscripts).insert([{
-        session_id: sessionIdRef.current,
-        speaker,
-        patient_phone: patient.phone,
-        patient_name: patient.name,
-        started_at: startedAt.toISOString(),
-        ended_at: endedAt.toISOString(),
-        language: navigator.language || 'unknown',
-        transcript: transcript.trim(),
-      }]);
-    } catch (error) {
-      console.warn('Transcript logging failed', error);
-      addActionLog('Transcript logging failed', 'error');
-    }
-  }, [patient, addActionLog]);
+    if (transcriptFlushTimerRef.current) clearTimeout(transcriptFlushTimerRef.current);
+    transcriptFlushTimerRef.current = setTimeout(() => {
+      flushTranscriptBuffer();
+    }, 2000);
+  }, [patient, flushTranscriptBuffer]);
 
   const fetchData = useCallback(async (phone: string) => {
     if (!isSupabaseConfigured()) return;
-    
-    const { data: drData, error: drError } = await supabase
-      .from(DB_TABLES.doctorAppointments)
-      .select(`*, ${DB_TABLES.doctors}(*)`)
-      .eq('patient_phone', phone)
-      .order('appointment_time', { ascending: false });
-    
-    const { data: labData } = await supabase
-      .from(DB_TABLES.labAppointments)
-      .select(`*, ${DB_TABLES.labs}(*)`)
-      .eq('patient_phone', phone)
-      .order('appointment_time', { ascending: false });
 
-    if (drError) addActionLog(`Sync Error: ${drError.message}`, 'error');
-    
-    const combined = [
-      ...(drData || []).map(a => ({ ...a, type: 'doctor' })),
-      ...(labData || []).map(a => ({ ...a, type: 'lab' }))
-    ].sort((a, b) => new Date(b.appointment_time).getTime() - new Date(a.appointment_time).getTime());
+    setIsLoading(true);
+    try {
+      const [
+        { data: drData, error: drError },
+        { data: labData },
+        { data: summaryData },
+      ] = await Promise.all([
+        supabase
+          .from(DB_TABLES.doctorAppointments)
+          .select(`*, ${DB_TABLES.doctors}(*)`)
+          .eq('patient_phone', phone)
+          .order('appointment_time', { ascending: false }),
+        supabase
+          .from(DB_TABLES.labAppointments)
+          .select(`*, ${DB_TABLES.labs}(*)`)
+          .eq('patient_phone', phone)
+          .order('appointment_time', { ascending: false }),
+        supabase
+          .from(DB_TABLES.userCallSummary)
+          .select('*')
+          .eq('user_number', phone)
+          .order('created_at', { ascending: false }),
+      ]);
 
-    setAppointments(combined as any);
+      if (drError) addActionLog(`Sync Error: ${drError.message}`, 'error');
 
-    const { data: summaryData } = await supabase
-      .from(DB_TABLES.userCallSummary)
-      .select('*')
-      .eq('user_number', phone)
-      .order('created_at', { ascending: false });
-    
-    if (summaryData) setSummaries(summaryData);
+      const combined = [
+        ...(drData || []).map(a => ({ ...a, type: 'doctor' })),
+        ...(labData || []).map(a => ({ ...a, type: 'lab' }))
+      ].sort((a, b) => new Date(b.appointment_time).getTime() - new Date(a.appointment_time).getTime());
+
+      setAppointments(combined as any);
+      if (summaryData) setSummaries(summaryData);
+    } finally {
+      setIsLoading(false);
+    }
   }, [addActionLog]);
 
   useEffect(() => {
@@ -312,6 +366,10 @@ const App: React.FC = () => {
     awaitingFirstResponseRef.current = false;
     lastTranscriptEventAtRef.current = null;
     transcriptRef.current = [];
+    // Flush any buffered transcript turns and clear debounce timer
+    if (transcriptFlushTimerRef.current) clearTimeout(transcriptFlushTimerRef.current);
+    await flushTranscriptBuffer();
+    transcriptBufferRef.current = [];
     if (sessionRef.current) try { await sessionRef.current.close(); } catch(e) {}
     sourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
     sourcesRef.current.clear();
@@ -328,7 +386,7 @@ const App: React.FC = () => {
 
     addActionLog('Maya session concluded', 'info');
     logToDebug('SESSION_ENDED');
-  }, [patient, addActionLog, logToDebug]);
+  }, [patient, addActionLog, logToDebug, flushTranscriptBuffer]);
 
   const executeToolCall = useCallback(async (fc: any): Promise<ToolResult> => {
     if (!patient) {
@@ -336,7 +394,7 @@ const App: React.FC = () => {
     }
 
     const startedAt = Date.now();
-    await logToDebug('TOOL_CALL_RECEIVED', { tool_name: fc.name, args: fc.args ?? {} });
+    logToDebug('TOOL_CALL_RECEIVED', { tool_name: fc.name, args: fc.args ?? {} });
     addActionLog(`Maya requested ${fc.name}`, 'tool');
 
     try {
@@ -435,10 +493,9 @@ const App: React.FC = () => {
               'DOCTOR_SLOT_REQUIRED',
               'A real doctor slot is required before booking. Please check doctor slots first.',
             );
-            const durationMs = Date.now() - startedAt;
-            await logToDebug('TOOL_CALL_FAILED', {
+            logToDebug('TOOL_CALL_FAILED', {
               tool_name: fc.name,
-              duration_ms: durationMs,
+              duration_ms: Date.now() - startedAt,
               args: fc.args ?? {},
               result,
             });
@@ -612,10 +669,9 @@ const App: React.FC = () => {
               'DOCTOR_SLOT_REQUIRED',
               'A real available slot is required before rescheduling. Please check doctor slots first.',
             );
-            const durationMs = Date.now() - startedAt;
-            await logToDebug('TOOL_CALL_FAILED', {
+            logToDebug('TOOL_CALL_FAILED', {
               tool_name: fc.name,
-              duration_ms: durationMs,
+              duration_ms: Date.now() - startedAt,
               args: fc.args ?? {},
               result,
             });
@@ -718,10 +774,9 @@ const App: React.FC = () => {
         result = createToolError('TOOL_NOT_IMPLEMENTED', `Tool '${fc.name}' is not implemented by the app.`);
       }
 
-      const durationMs = Date.now() - startedAt;
-      await logToDebug(result.success ? 'TOOL_CALL_SUCCEEDED' : 'TOOL_CALL_FAILED', {
+      logToDebug(result.success ? 'TOOL_CALL_SUCCEEDED' : 'TOOL_CALL_FAILED', {
         tool_name: fc.name,
-        duration_ms: durationMs,
+        duration_ms: Date.now() - startedAt,
         args: fc.args ?? {},
         result,
       });
@@ -732,7 +787,7 @@ const App: React.FC = () => {
       return result;
     } catch (error: any) {
       const result = createToolError('TOOL_EXECUTION_EXCEPTION', error?.message || 'Unexpected tool execution error.');
-      await logToDebug('TOOL_CALL_EXCEPTION', {
+      logToDebug('TOOL_CALL_EXCEPTION', {
         tool_name: fc.name,
         args: fc.args ?? {},
         error_message: error?.message || 'Unknown error',
@@ -850,7 +905,7 @@ const App: React.FC = () => {
               recordToolLatency('MODEL_REQUESTED_TOOL', { tool_count: msg.toolCall.functionCalls.length });
               for (const fc of msg.toolCall.functionCalls) {
                 const result = await executeToolCall(fc);
-                await logToDebug('TOOL_RESPONSE_SENT', { tool_name: fc.name, result });
+                logToDebug('TOOL_RESPONSE_SENT', { tool_name: fc.name, result });
                 sessionPromise.then(s => s.sendToolResponse({ functionResponses: { id: fc.id, name: fc.name, response: result } }));
               }
             }
@@ -940,7 +995,7 @@ const App: React.FC = () => {
             <section className="space-y-4">
               <h3 className="text-lg font-black flex items-center px-1"><Calendar className="w-5 h-5 mr-2.5 text-indigo-600" /> Upcoming</h3>
               <div className="space-y-3">
-                {paginatedUpcoming.length === 0 ? <div className="bg-slate-50/50 border border-dashed border-slate-200 rounded-2xl p-8 text-center text-slate-400 text-sm font-bold">No upcoming visits.</div> : 
+                {isLoading ? <SkeletonCard /> : paginatedUpcoming.length === 0 ? <div className="bg-slate-50/50 border border-dashed border-slate-200 rounded-2xl p-8 text-center text-slate-400 text-sm font-bold">No upcoming visits.</div> : 
                 paginatedUpcoming.map(app => (
                   <div key={app.id} className="bg-white border border-slate-100 p-4 rounded-xl flex items-center justify-between hover:shadow-md transition-all group">
                     <div className="flex items-center space-x-4 min-w-0">
@@ -978,7 +1033,7 @@ const App: React.FC = () => {
             <section className="space-y-4">
               <h3 className="text-lg font-black text-slate-400 flex items-center px-1"><History className="w-5 h-5 mr-2.5" /> Past Records</h3>
               <div className="space-y-3">
-                {paginatedPast.length === 0 ? <div className="bg-slate-50/50 border border-dashed border-slate-200 rounded-2xl p-8 text-center text-slate-400 text-sm font-bold opacity-50">No history found.</div> : 
+                {isLoading ? <SkeletonCard /> : paginatedPast.length === 0 ? <div className="bg-slate-50/50 border border-dashed border-slate-200 rounded-2xl p-8 text-center text-slate-400 text-sm font-bold opacity-50">No history found.</div> : 
                 paginatedPast.map(app => (
                   <div key={app.id} className="bg-white/50 border border-slate-100 p-4 rounded-xl flex items-center justify-between opacity-75">
                     <div className="flex items-center space-x-4 min-w-0">
@@ -1017,7 +1072,7 @@ const App: React.FC = () => {
           <section className="space-y-5">
             <h3 className="text-lg font-black flex items-center px-1"><MessageSquare className="w-5 h-5 mr-2.5 text-indigo-600" /> Call Summaries</h3>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-              {summaries.length === 0 ? <div className="col-span-full bg-slate-50 border border-dashed border-slate-200 rounded-2xl p-8 text-center text-slate-400 text-sm font-bold">No summaries yet.</div> : 
+              {isLoading ? <SummarySkeletonCard /> : summaries.length === 0 ? <div className="col-span-full bg-slate-50 border border-dashed border-slate-200 rounded-2xl p-8 text-center text-slate-400 text-sm font-bold">No summaries yet.</div> : 
               summaries.map(summary => (
                 <div key={summary.call_id} className="bg-white border border-slate-100 p-5 rounded-xl space-y-3 hover:shadow-lg transition-all border-b-2 hover:border-indigo-200">
                   <div className="flex items-center justify-between">
