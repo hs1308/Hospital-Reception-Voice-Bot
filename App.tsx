@@ -113,7 +113,7 @@ const normalizeDoctorSlotRecord = (slot: any) => ({
 const normalizeLabSlotRecord = (slot: any) => ({
   id: slot.id,
   lab_id: slot.lab_id,
-  start_time: slot.start_time,
+  slot_time: slot.slot_time,
   is_available: slot.is_available,
   booked_by_phone: slot.booked_by_phone ?? null,
   appointment_id: slot.appointment_id ?? null,
@@ -194,6 +194,8 @@ const App: React.FC = () => {
   const pendingUserTranscriptRef = useRef<string>('');
   const pendingMayaTranscriptRef = useRef<string>('');
   const sessionActiveRef = useRef<boolean>(false);
+  const isMayaSpeakingRef = useRef<boolean>(false); // true while Maya's audio is playing locally
+  const isStoppingRef = useRef<boolean>(false);     // prevents stopMaya from running twice
 
   useEffect(() => {
     const saved = localStorage.getItem('nurse_maya_patient');
@@ -363,11 +365,13 @@ const App: React.FC = () => {
   }, [patient, fetchData]);
 
   const stopMaya = useCallback(async () => {
-    if (!sessionStartTimeRef.current) return;
+    if (!sessionStartTimeRef.current || isStoppingRef.current) return;
+    isStoppingRef.current = true;
 
     setBotState('idle');
     setIsMayaActive(false);
     sessionActiveRef.current = false;
+    isMayaSpeakingRef.current = false;
     
     const finalTranscript = transcriptRef.current.join(' ');
     const startTime = sessionStartTimeRef.current;
@@ -445,6 +449,7 @@ const App: React.FC = () => {
 
     addActionLog('Maya session concluded', 'info');
     logToDebug('SESSION_ENDED');
+    isStoppingRef.current = false;
   }, [patient, addActionLog, logToDebug, flushTranscriptBuffer, flushPendingTurnTranscripts]);
 
   const executeToolCall = useCallback(async (fc: any): Promise<ToolResult> => {
@@ -499,8 +504,8 @@ const App: React.FC = () => {
             .select(`*, lab:${DB_TABLES.labs}(id, test_name)`)
             .eq('lab_id', fc.args.lab_id)
             .eq('is_available', true)
-            .gte('start_time', startDate)
-            .order('start_time', { ascending: true });
+            .gte('slot_time', startDate)
+            .order('slot_time', { ascending: true });
 
           result = error
             ? createToolError('LAB_SLOTS_FETCH_FAILED', error.message)
@@ -544,8 +549,8 @@ const App: React.FC = () => {
           const nowIso = new Date().toISOString();
           result = createToolSuccess({
             appointments: combined,
-            upcoming: combined.filter((appointment) => appointment.status === 'scheduled' && appointment.appointment_time >= nowIso),
-            past: combined.filter((appointment) => appointment.status !== 'scheduled' || appointment.appointment_time < nowIso),
+            upcoming: combined.filter((a) => a.status === 'scheduled' && a.appointment_time >= nowIso),
+            past: combined.filter((a) => a.status !== 'scheduled' || a.appointment_time < nowIso),
           });
         }
       } else if (fc.name === 'book_doctor_appointment') {
@@ -671,7 +676,7 @@ const App: React.FC = () => {
           if (fc.args.slot_id) {
             slotQuery = slotQuery.eq('id', fc.args.slot_id);
           } else if (requestedTime) {
-            slotQuery = slotQuery.eq('start_time', requestedTime);
+            slotQuery = slotQuery.eq('slot_time', requestedTime);
           } else {
             result = createToolError(
               'LAB_SLOT_REQUIRED',
@@ -691,7 +696,7 @@ const App: React.FC = () => {
           } else {
             const { data: appointment, error: appointmentError } = await supabase
               .from(DB_TABLES.labAppointments)
-              .insert([{ patient_phone: patient.phone, lab_id: fc.args.lab_id, appointment_time: slot.start_time, status: 'scheduled' }])
+              .insert([{ patient_phone: patient.phone, lab_id: fc.args.lab_id, appointment_time: slot.slot_time, status: 'scheduled' }])
               .select(`*, ${DB_TABLES.labs}(*)`)
               .single();
 
@@ -912,7 +917,7 @@ const App: React.FC = () => {
           if (fc.args.slot_id) {
             slotQuery = slotQuery.eq('id', fc.args.slot_id);
           } else if (requestedTime) {
-            slotQuery = slotQuery.eq('start_time', requestedTime);
+            slotQuery = slotQuery.eq('slot_time', requestedTime);
           } else {
             result = createToolError('LAB_SLOT_REQUIRED', 'A real available slot is required before rescheduling. Please check lab slots first.');
             logToDebug('TOOL_CALL_FAILED', { tool_name: fc.name, duration_ms: Date.now() - startedAt, args: fc.args ?? {}, result });
@@ -927,7 +932,7 @@ const App: React.FC = () => {
           } else {
             const { data: updatedAppointment, error: updateError } = await supabase
               .from(DB_TABLES.labAppointments)
-              .update({ appointment_time: newSlot.start_time, status: 'scheduled' })
+              .update({ appointment_time: newSlot.slot_time, status: 'scheduled' })
               .eq('id', fc.args.appointment_id)
               .eq('patient_phone', patient.phone)
               .select(`*, ${DB_TABLES.labs}(*)`)
@@ -1046,7 +1051,8 @@ const App: React.FC = () => {
             const scriptProcessor = inCtx.createScriptProcessor(2048, 1, 1);
             
             scriptProcessor.onaudioprocess = (e) => {
-              if (!sessionActiveRef.current) return;
+              // Pause mic while Maya is speaking to prevent her own voice confusing Gemini's VAD
+              if (!sessionActiveRef.current || isMayaSpeakingRef.current) return;
               const rawInput = e.inputBuffer.getChannelData(0);
               const resampledData = resample(rawInput, inCtx.sampleRate, 16000);
               const int16 = new Int16Array(resampledData.length);
@@ -1092,11 +1098,12 @@ const App: React.FC = () => {
               flushPendingTurnTranscripts();
             }
 
-            // User interrupted Maya mid-speech — stop all queued audio immediately
+            // User interrupted Maya mid-speech — stop queued audio and re-open the mic
             if (msg.serverContent?.interrupted) {
               sourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
               sourcesRef.current.clear();
               nextStartTimeRef.current = 0;
+              isMayaSpeakingRef.current = false;
               setBotState('listening');
               addActionLog('Interrupted by user', 'info');
             }
@@ -1104,6 +1111,7 @@ const App: React.FC = () => {
             const base64Audio = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
             if (base64Audio) {
               setBotState('speaking');
+              isMayaSpeakingRef.current = true;
               if (awaitingFirstResponseRef.current) {
                 awaitingFirstResponseRef.current = false;
                 recordToolLatency('FIRST_AUDIO_RESPONSE_STARTED');
@@ -1114,7 +1122,10 @@ const App: React.FC = () => {
               source.connect(outCtx.destination);
               source.onended = () => {
                 sourcesRef.current.delete(source);
-                if (sourcesRef.current.size === 0) setBotState('listening');
+                if (sourcesRef.current.size === 0) {
+                  isMayaSpeakingRef.current = false;
+                  setBotState('listening');
+                }
               };
               const startTime = Math.max(nextStartTimeRef.current, outCtx.currentTime);
               source.start(startTime);
