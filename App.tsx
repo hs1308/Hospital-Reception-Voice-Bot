@@ -1064,10 +1064,10 @@ const App: React.FC = () => {
             source.connect(scriptProcessor);
             scriptProcessor.connect(inCtx.destination);
 
-            // Trigger Maya's greeting immediately so she speaks first before the user says anything
-            sessionPromise.then(s => s.sendClientContent({
-              turns: [{ role: 'user', parts: [{ text: '__GREET__' }] }],
-              turnComplete: true,
+            // Trigger Maya's greeting immediately using realtimeInput (text mode)
+            // sendClientContent is not supported on native audio models
+            sessionPromise.then(s => s.sendRealtimeInput({
+              text: '__GREET__',
             }));
           },
           onmessage: async (msg: LiveServerMessage) => {
